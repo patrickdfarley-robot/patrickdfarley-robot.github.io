@@ -89,6 +89,15 @@ function mulberry32(a) {
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
+function hsl2rgb(h, s, l) {
+  h = (((h % 360) + 360) % 360) / 30;
+  function f(n) {
+    var k = (n + h) % 12;
+    var a = s * Math.min(l, 1 - l);
+    return l - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)));
+  }
+  return [f(0), f(8), f(4)];
+}
 
 /* ---------------- data intake (defensive) ---------------- */
 var RAW = (window.ROB64_DATA && typeof window.ROB64_DATA === "object") ? window.ROB64_DATA : SAMPLE;
@@ -244,6 +253,14 @@ var COL = {};
   }
 })();
 var EMBER_COL = "hsl(22,90%,55%)";
+/* linear-ish RGB triples for the WebGL lit path */
+var FRGB = { order: hsl2rgb(FAC.order.hue, 0.9, 0.65), entropy: hsl2rgb(FAC.entropy.hue, 0.9, 0.65) };
+var BOLT_RGB = { order: hsl2rgb(FAC.order.hue, 0.95, 0.72), entropy: hsl2rgb(FAC.entropy.hue, 0.95, 0.72) };
+var SHIM_RGB = { order: hsl2rgb(FAC.order.hue, 0.8, 0.78), entropy: hsl2rgb(FAC.entropy.hue, 0.8, 0.78) };
+var WARM_RGB = hsl2rgb(28, 0.92, 0.6);
+var EMBER_RGB = hsl2rgb(22, 0.9, 0.55);
+var GLOW_RGB = { warm: WARM_RGB, white: [1, 1, 1], order: FRGB.order, entropy: FRGB.entropy };
+var DEBRIS_RGB = [0.26, 0.29, 0.35];
 
 /* ---------------- static ambience (fractional coords, resize-proof) ---------------- */
 var DEB = [];   // drifting debris; pos is a periodic function of time (never wanders off)
@@ -259,11 +276,13 @@ for (var ti2 = 0; ti2 < 8; ti2++) {
 }
 var DIST = [];  // far depth layer: distant traffic, slow and low-contrast
 for (var zi = 0; zi < 7; zi++) {
+  var dHue = rng() < 0.5 ? FAC.order.hue : FAC.entropy.hue;
   DIST.push({
     fx: rng(), fy: 0.05 + rng() * 0.85,
     len: 2.5 + rng() * 4.5,
     dvx: (rng() < 0.5 ? -1 : 1) * (0.0008 + rng() * 0.0016),
-    col: "hsla(" + (rng() < 0.5 ? FAC.order.hue : FAC.entropy.hue) + ",18%,62%,1)"
+    col: "hsla(" + dHue + ",18%,62%,1)",
+    rgb: hsl2rgb(dHue, 0.18, 0.62)
   });
 }
 
@@ -288,7 +307,8 @@ for (var ski = 0; ski < 36; ski++) {
 function spawnBolt(sx, sy, tx, ty, fk, tcap, delay, heavy) {
   var b = BOLTS[boltIdx]; boltIdx = (boltIdx + 1) % BOLTS.length;
   var dx = tx - sx, dy = ty - sy, d = Math.sqrt(dx * dx + dy * dy) || 1;
-  var sp = minDim * (heavy ? 0.28 : 0.55);   // heavy shells travel slower, feel heavier
+  var sp = minDim * (heavy ? 0.20 : 0.38);   // slow enough that a bolt's moving
+                                             // highlight visibly rakes along a hull
   b.active = true; b.delay = delay || 0; b.age = 0; b.ttl = d / sp;
   b.x = sx; b.y = sy; b.sx = sx; b.sy = sy;
   b.vx = dx / d * sp; b.vy = dy / d * sp;
@@ -444,6 +464,8 @@ function buildShipSprite(cap) {
   cnv.width = cw; cnv.height = ch;
   var g = cnv.getContext("2d");
   var hue = FAC[cap.fac].hue;
+  // generating geometry recorded for the analytic normal-map bake (GL path)
+  cap.geoTiers = []; cap.geoBells = []; cap.geoEms = [];
   // key light comes from screen-top for every ship; pick which local edge that is
   var up = Math.cos(cap.baseAng) >= 0 ? -1 : 1;
   g.translate(pad, ch / 2);          // hull local: x in [0,L] (nose at +x), y about 0
@@ -483,11 +505,13 @@ function buildShipSprite(cap) {
     var u = st / NS;
     sx.push(u * L); sd.push(-HH * prof(dC, u)); sv.push(HH * prof(vC, u));
   }
-  // main hull, lit from the screen-up side
+  // main hull, lit from the screen-up side. The GL bake keeps the gradient
+  // nearly flat so the dynamic key light + point lights sculpt the hull;
+  // the 2D fallback keeps the strong baked shading.
   var hgrad = g.createLinearGradient(0, up * HH * 0.7, 0, -up * HH * 0.7);
-  hgrad.addColorStop(0, hsl(11, 21));
-  hgrad.addColorStop(0.45, hsl(10, 13));
-  hgrad.addColorStop(1, hsl(12, 7));
+  hgrad.addColorStop(0, hsl(11, GLR ? 17 : 21));
+  hgrad.addColorStop(0.45, hsl(10, GLR ? 14 : 13));
+  hgrad.addColorStop(1, hsl(12, GLR ? 11 : 7));
   g.fillStyle = hgrad;
   g.beginPath();
   g.moveTo(sx[NS], sd[NS]);
@@ -531,9 +555,13 @@ function buildShipSprite(cap) {
       g.fillStyle = hsl(9, 15 - tr * 2);
       if (side < 0) { g.fillRect(tx2, ty - th2, tw2, th2 + 1); ty -= th2; }
       else          { g.fillRect(tx2, ty - 1, tw2, th2 + 1); ty += th2; }
+      cap.geoTiers.push({ x: tx2, y: side < 0 ? ty : ty - th2 - 1, w: tw2, h: th2 + 1, side: side });
       g.fillStyle = "rgba(210,224,240,0.75)";
       for (var wv = tx2 + 2; wv < tx2 + tw2 - 2; wv += 4) {
-        if (sr() < 0.6) g.fillRect(wv, side < 0 ? ty + 2 : ty - 3, 1, 1);
+        if (sr() < 0.6) {
+          g.fillRect(wv, side < 0 ? ty + 2 : ty - 3, 1, 1);
+          cap.geoEms.push({ x: wv, y: side < 0 ? ty + 2 : ty - 3, w: 1, h: 1, e: 0.6 });
+        }
       }
     }
     return { x0: x0, w0: w0, ty: ty };
@@ -598,6 +626,7 @@ function buildShipSprite(cap) {
       if (sr() < litFrac) {
         g.fillStyle = sr() < 0.85 ? "rgba(215,228,242,0.85)" : hsl(80, 70);
         g.globalAlpha = 0.55 + sr() * 0.45;
+        cap.geoEms.push({ x: wx2, y: ry, w: 2, h: 1, e: 0.35 + 0.5 * g.globalAlpha });
       } else {
         g.fillStyle = "rgba(90,100,115,0.35)";
         g.globalAlpha = 0.6;
@@ -622,6 +651,7 @@ function buildShipSprite(cap) {
     g.fillStyle = cg;
     g.beginPath(); g.arc(-rb * 0.5, ey, rb * 0.8, 0, 6.283); g.fill();
     cap.eng.push(-L / 2 - rb * 0.5, ey);
+    cap.geoBells.push({ x: -rb * 0.4, y: ey, r: rb });
   }
   // painted fleet glyph blocks near the bow, derived from the label (never text)
   var gr = mulberry32(strSeed(cap.label || "hull"));
@@ -667,86 +697,146 @@ function buildShipSprite(cap) {
   for (var m = 0; m < nEmber; m++) {
     cap.embers.push(L * (0.1 + sr() * 0.8) - L / 2, (sr() - 0.5) * HH * 0.5, sr() * 6.283);
   }
+  // normal map re-derived from THIS hull's generating geometry: the jittered
+  // per-faction profile stations (sd/sv) drive the cross-section sweep; tier
+  // rects, bells and emissive windows were recorded above as they were drawn
+  cap.nrm = null;
+  if (GLR) {
+    var profAt = function (arr) {
+      return function (lx) {
+        var u = clamp(lx / L, 0, 1) * NS;
+        var i0 = Math.floor(u), i1 = Math.min(NS, i0 + 1);
+        return arr[i0] + (arr[i1] - arr[i0]) * (u - i0);
+      };
+    };
+    cap.nrm = bakeNormals(cw, ch, pad, ch / 2, L, profAt(sd), profAt(sv),
+      { tiers: cap.geoTiers, bells: cap.geoBells, ems: cap.geoEms, prow: blocky ? 3 : 0 });
+  }
   cap.sprite = cnv; cap.sw = cw; cap.sh = ch;
 }
 
-/* ---- near-field silhouettes: enormous hulls crossing very close to camera,
-        with a real rim light, grazed surface, portholes and running lights ---- */
+/* ---- near-field silhouette: ONE enormous hull crossing very close to camera,
+        riding low so the frame edge crops it hard — it reads as huge without
+        swallowing the fleet. Rim light, grazed surface, portholes, running
+        lights. GL bakes a mid-dark material rendered at very low ambient, so
+        an explosion can flood it out of darkness; the 2D fallback keeps the
+        near-black bake. ---- */
 var NEAR = [];
 function buildNearSprites() {
   NEAR.length = 0;
-  for (var i = 0; i < 2; i++) {
-    var nr = mulberry32(SEED ^ (0x517cc1b7 + i * 101));
-    var len = minDim * (0.6 + i * 0.5), hh = len * 0.14;
-    var cw = Math.ceil(len) + 6, ch = Math.ceil(hh * 3.2) + 6;
-    var cnv = document.createElement("canvas");
-    cnv.width = cw; cnv.height = ch;
-    var g = cnv.getContext("2d");
-    g.translate(3, ch / 2);
-    function nj(a) { return (nr() - 0.5) * a; }
-    // chiselled silhouette: wedge prow, dorsal fin, mast root, engine block aft
-    var top = [
-      [1, -0.08], [0.86 + nj(0.04), -0.5], [0.64, -(0.58 + nj(0.08))],
-      [0.60, -1.05], [0.46 + nj(0.05), -1.05], [0.43, -0.62],
-      [0.18, -(0.70 + nj(0.08))], [0.15, -0.92], [0.10, -0.92], [0, -0.55]
-    ];
-    var bot = [
-      [0, 0.6], [0.2 + nj(0.06), 0.78], [0.55, 0.72 + nj(0.08)],
-      [0.78, 0.42], [0.95, 0.3], [1, 0.08]
-    ];
-    var fill = g.createLinearGradient(0, -hh * 1.3, 0, hh);
+  var nr = mulberry32(SEED ^ 0x517cc1b7);
+  var len = minDim * 1.35, hh = len * 0.15;
+  var cw = Math.ceil(len) + 6, ch = Math.ceil(hh * 3.2) + 6;
+  var cnv = document.createElement("canvas");
+  cnv.width = cw; cnv.height = ch;
+  var g = cnv.getContext("2d");
+  g.translate(3, ch / 2);
+  function nj(a) { return (nr() - 0.5) * a; }
+  // chiselled silhouette: wedge prow, dorsal fin, mast root, engine block aft
+  var top = [
+    [1, -0.08], [0.86 + nj(0.04), -0.5], [0.64, -(0.58 + nj(0.08))],
+    [0.60, -1.05], [0.46 + nj(0.05), -1.05], [0.43, -0.62],
+    [0.18, -(0.70 + nj(0.08))], [0.15, -0.92], [0.10, -0.92], [0, -0.55]
+  ];
+  var bot = [
+    [0, 0.6], [0.2 + nj(0.06), 0.78], [0.55, 0.72 + nj(0.08)],
+    [0.78, 0.42], [0.95, 0.3], [1, 0.08]
+  ];
+  var fill = g.createLinearGradient(0, -hh * 1.3, 0, hh);
+  if (GLR) {
+    fill.addColorStop(0, "hsl(218,14%,30%)");
+    fill.addColorStop(0.18, "hsl(220,15%,19%)");
+    fill.addColorStop(1, "hsl(222,16%,13%)");
+  } else {
     fill.addColorStop(0, "hsl(218,14%,9%)");    // the key light grazing the top
     fill.addColorStop(0.18, "hsl(220,15%,4%)");
     fill.addColorStop(1, "hsl(222,16%,2%)");
-    g.fillStyle = fill;
-    g.beginPath();
-    g.moveTo(len * top[0][0], hh * top[0][1]);
-    for (var v = 1; v < top.length; v++) g.lineTo(len * top[v][0], hh * top[v][1]);
-    for (var v2 = 0; v2 < bot.length; v2++) g.lineTo(len * bot[v2][0], hh * bot[v2][1]);
-    g.closePath();
-    g.fill();
-    // surface hints only where the light grazes the upper hull; recessed bays stay subtle
-    g.fillStyle = "rgba(170,190,215,0.035)";
-    for (var pp = 0; pp < 4; pp++) {
-      g.fillRect(len * (0.1 + nr() * 0.75), -hh * (0.52 + nr() * 0.25), len * (0.03 + nr() * 0.06), hh * 0.10);
-    }
-    g.fillStyle = "rgba(0,0,0,0.35)";
-    for (var qq = 0; qq < 4; qq++) {
-      g.fillRect(len * (0.15 + nr() * 0.7), hh * (0.05 + nr() * 0.4), len * (0.03 + nr() * 0.06), hh * 0.12);
-    }
-    // real rim light along the key-lit edge: soft pass, then a hard pass
-    for (var rp = 0; rp < 2; rp++) {
-      g.strokeStyle = rp ? "rgba(215,232,252,0.55)" : "rgba(195,215,240,0.16)";
-      g.lineWidth = rp ? 1.2 : 3.5;
+  }
+  g.fillStyle = fill;
+  g.beginPath();
+  g.moveTo(len * top[0][0], hh * top[0][1]);
+  for (var v = 1; v < top.length; v++) g.lineTo(len * top[v][0], hh * top[v][1]);
+  for (var v2 = 0; v2 < bot.length; v2++) g.lineTo(len * bot[v2][0], hh * bot[v2][1]);
+  g.closePath();
+  g.fill();
+  // surface hints only where the light grazes the upper hull; recessed bays stay subtle
+  g.fillStyle = "rgba(170,190,215,0.035)";
+  for (var pp = 0; pp < 4; pp++) {
+    g.fillRect(len * (0.1 + nr() * 0.75), -hh * (0.52 + nr() * 0.25), len * (0.03 + nr() * 0.06), hh * 0.10);
+  }
+  g.fillStyle = "rgba(0,0,0,0.35)";
+  for (var qq = 0; qq < 4; qq++) {
+    g.fillRect(len * (0.15 + nr() * 0.7), hh * (0.05 + nr() * 0.4), len * (0.03 + nr() * 0.06), hh * 0.12);
+  }
+  if (GLR) {   // panel seams that only read when a light rakes the hull
+    g.strokeStyle = "rgba(0,0,0,0.38)";
+    g.lineWidth = 1;
+    for (var sm = len * 0.08; sm < len * 0.92; sm += 26 + nr() * 14) {
       g.beginPath();
-      g.moveTo(len * top[0][0], hh * top[0][1]);
-      for (var rv = 1; rv < top.length; rv++) g.lineTo(len * top[rv][0], hh * top[rv][1]);
+      g.moveTo(sm, -hh * 0.6);
+      g.lineTo(sm + (nr() - 0.5) * 10, hh * 0.55);
       g.stroke();
     }
-    // dim porthole rows — inhabited, not a cutout
-    g.fillStyle = "rgba(190,205,228,0.16)";
-    for (var p2 = 0; p2 < 14; p2++) {
-      g.fillRect(len * (0.08 + nr() * 0.84), (nr() - 0.3) * hh * 0.7, 1.6, 1.6);
-    }
-    // faint warm engine slits at the stern
-    g.fillStyle = "hsla(" + (nr() < 0.5 ? FAC.order.hue : FAC.entropy.hue) + ",60%,60%,0.25)";
-    for (var eb = 0; eb < 3; eb++) g.fillRect(1, -hh * 0.3 + eb * hh * 0.28, 2.5, hh * 0.14);
-    // running lights blink live (sprite-centered coords)
-    var lights = new Float32Array(9);
-    var lu = [1.0, 0.60, 0.15], lv = [-0.08, -1.02, -0.90];
-    for (var lt = 0; lt < 3; lt++) {
-      lights[lt * 3] = len * lu[lt] + 3 - cw / 2;
-      lights[lt * 3 + 1] = hh * lv[lt];
-      lights[lt * 3 + 2] = nr();
-    }
-    NEAR.push({
-      cnv: cnv, cw: cw, ch: ch,
-      w: 6.283 / (460 + i * 320), ph: nr() * 6.283, ph2: nr() * 6.283,
-      ang: (nr() - 0.5) * 0.24, yf: i === 0 ? 0.16 : 0.72,
-      flip: nr() < 0.5 ? -1 : 1,
-      lights: lights, lper: 1.8 + nr() * 1.6
-    });
   }
+  // real rim light along the key-lit edge: soft pass, then a hard pass
+  for (var rp = 0; rp < 2; rp++) {
+    g.strokeStyle = rp ? "rgba(215,232,252,0.55)" : "rgba(195,215,240,0.16)";
+    g.lineWidth = rp ? 1.2 : 3.5;
+    g.beginPath();
+    g.moveTo(len * top[0][0], hh * top[0][1]);
+    for (var rv = 1; rv < top.length; rv++) g.lineTo(len * top[rv][0], hh * top[rv][1]);
+    g.stroke();
+  }
+  // dim porthole rows — inhabited, not a cutout (emissive in the GL bake)
+  var ems = [];
+  g.fillStyle = GLR ? "rgba(205,218,240,0.5)" : "rgba(190,205,228,0.16)";
+  for (var p2 = 0; p2 < 14; p2++) {
+    var ppx = len * (0.08 + nr() * 0.84), ppy = (nr() - 0.3) * hh * 0.7;
+    g.fillRect(ppx, ppy, 1.6, 1.6);
+    ems.push({ x: ppx, y: ppy, w: 1.6, h: 1.6, e: 0.55 });
+  }
+  // faint warm engine slits at the stern
+  g.fillStyle = "hsla(" + (nr() < 0.5 ? FAC.order.hue : FAC.entropy.hue) + ",60%,60%,0.25)";
+  for (var eb = 0; eb < 3; eb++) {
+    g.fillRect(1, -hh * 0.3 + eb * hh * 0.28, 2.5, hh * 0.14);
+    ems.push({ x: 1, y: -hh * 0.3 + eb * hh * 0.28, w: 2.5, h: hh * 0.14, e: 0.45 });
+  }
+  // running lights blink live (sprite-centered coords)
+  var lights = new Float32Array(9);
+  var lu = [1.0, 0.60, 0.15], lv = [-0.08, -1.02, -0.90];
+  for (var lt = 0; lt < 3; lt++) {
+    lights[lt * 3] = len * lu[lt] + 3 - cw / 2;
+    lights[lt * 3 + 1] = hh * lv[lt];
+    lights[lt * 3 + 2] = nr();
+  }
+  // normals swept from the silhouette's own generating polylines
+  var nrm = null;
+  if (GLR) {
+    var topP = [], botP = [], pv;
+    for (pv = top.length - 1; pv >= 0; pv--) topP.push([len * top[pv][0], hh * top[pv][1]]);
+    for (pv = 0; pv < bot.length; pv++) botP.push([len * bot[pv][0], hh * bot[pv][1]]);
+    var polyAt = function (P) {
+      return function (lx) {
+        if (lx <= P[0][0]) return P[0][1];
+        for (var k = 1; k < P.length; k++) {
+          if (lx <= P[k][0]) {
+            var a = P[k - 1], b = P[k];
+            return a[1] + (b[1] - a[1]) * ((lx - a[0]) / ((b[0] - a[0]) || 1));
+          }
+        }
+        return P[P.length - 1][1];
+      };
+    };
+    nrm = bakeNormals(cw, ch, 3, ch / 2, len, polyAt(topP), polyAt(botP),
+      { tiers: [], bells: [], ems: ems, prow: 0 });
+  }
+  NEAR.push({
+    cnv: cnv, cw: cw, ch: ch, nrm: nrm,
+    w: 6.283 / 620, ph: nr() * 6.283, ph2: nr() * 6.283,
+    ang: (nr() - 0.5) * 0.16, yf: 0.90,
+    flip: nr() < 0.5 ? -1 : 1,
+    lights: lights, lper: 1.8 + nr() * 1.6
+  });
 }
 
 function layoutCapitals() {
@@ -823,6 +913,7 @@ function resize() {
   layoutCapitals();
   buildStarfield();
   buildNearSprites();
+  if (GLR) glResize();
   for (var i = 0; i < ftrs.length; i++) {
     var f = ftrs[i];
     f.spd = minDim * (0.06 + 0.11 * f.spd01);
@@ -1159,7 +1250,7 @@ function draw(tSec) {
     var b = BOLTS[i];
     if (!b.active || b.delay > 0) continue;
     var bw = b.heavy ? 4.2 : 2.2;
-    var tl = b.heavy ? 0.20 : 0.13;
+    var tl = b.heavy ? 0.26 : 0.16;
     ctx.globalAlpha = 0.85;
     ctx.strokeStyle = COL[b.fac].bolt;
     ctx.lineWidth = bw * 1.9;
@@ -1207,7 +1298,7 @@ function draw(tSec) {
   // near depth layer: dark silhouettes drifting across, occluding everything
   for (i = 0; i < NEAR.length; i++) {
     var ns = NEAR[i];
-    var nx = W * 0.5 + Math.sin(tSec * ns.w + ns.ph) * W * 0.75;
+    var nx = W * 0.5 + Math.sin(tSec * ns.w + ns.ph) * W * 0.72;
     var ny = H * ns.yf + Math.sin(tSec * ns.w * 0.6 + ns.ph2) * H * 0.035;
     ctx.save();
     ctx.translate(nx, ny);
@@ -1226,6 +1317,593 @@ function draw(tSec) {
     ctx.globalAlpha = 1;
     ctx.restore();
   }
+}
+
+/* =====================================================================
+   WebGL2 lit layer.
+   Every sprite is baked twice: albedo (the existing 2D bake) and a
+   tangent-space normal map derived from the generating geometry — never
+   from filtering the albedo. For capitals the jittered per-faction
+   profile stations (the same sd/sv arrays the silhouette was drawn
+   from) drive a rounded-slab cross-section sweep; superstructure tiers
+   recorded by tierStack() get flat faces with bevels oriented by which
+   side of the hull they grow from; engine bells get concave rings with
+   a hot emissive core; the Order hammerhead's flat bow face gets
+   forward-facing normals; lit windows recorded during the albedo bake
+   become an emissive mask in A. The near silhouette is swept the same
+   way from its own top/bottom generating polylines. Both bakes go into
+   one atlas pair; the whole frame is ONE instanced draw with
+   premultiplied blending (alpha-out 0 == additive). Up to 24 point
+   lights come from the sim: explosions, bolts in flight (with a
+   lingering tail), muzzle flashes, engine plumes. If WebGL2 is
+   unavailable or the context is lost, GLR stays null and the untouched
+   Canvas 2D path above renders instead.
+   ===================================================================== */
+var GLR = null;
+var MAXI = 2048, MAXL = 24;
+
+/* Shared analytic normal baker. topAt/botAt give the dorsal/ventral
+   generating profile's local y at hull-local x in [0, xMax]; geo carries
+   tier rects (with side), bells, emissive rects, and the bow-face width. */
+function bakeNormals(w, h, ox, oy, xMax, topAt, botAt, geo) {
+  var out = new Uint8ClampedArray(w * h * 4);
+  var x, y, i, oo;
+  for (i = 0; i < out.length; i += 4) { out[i] = 128; out[i + 1] = 128; out[i + 2] = 255; }
+  for (x = 0; x < w; x++) {
+    var lx = x - ox + 0.5;
+    if (lx < 0 || lx > xMax) continue;
+    var T = topAt(lx), B = botAt(lx);
+    if (!(B > T)) continue;
+    var la = Math.max(0, lx - 2), lb2 = Math.min(xMax, lx + 2);
+    var dT = (topAt(lb2) - topAt(la)) / ((lb2 - la) || 1);
+    var dB = (botAt(lb2) - botAt(la)) / ((lb2 - la) || 1);
+    var y0 = Math.max(0, Math.round(oy + T)), y1 = Math.min(h - 1, Math.round(oy + B));
+    for (y = y0; y <= y1; y++) {
+      oo = (y * w + x) * 4;
+      // rounded-slab sweep: q in [-1,1] across the local cross-section
+      var q = clamp(((y - oy - T) / (B - T)) * 2 - 1, -1, 1);
+      var ny = (q < 0 ? -1 : 1) * Math.pow(Math.abs(q), 1.35) * 0.9;
+      var nx = clamp((q < 0 ? dT : -dB) * (0.35 + 0.65 * Math.abs(q)), -0.85, 0.85);
+      if (geo.prow && lx > xMax - geo.prow) { nx = 0.85; ny *= 0.25; }   // flat bow face
+      var l2 = nx * nx + ny * ny;
+      if (l2 > 0.94) { var sc2 = Math.sqrt(0.94 / l2); nx *= sc2; ny *= sc2; l2 = 0.94; }
+      var nz = Math.sqrt(1 - l2);
+      out[oo] = nx * 127 + 128; out[oo + 1] = ny * 127 + 128; out[oo + 2] = nz * 127 + 128; out[oo + 3] = 0;
+    }
+  }
+  for (i = 0; i < geo.tiers.length; i++) {           // flat tier faces + bevels
+    var tr = geo.tiers[i];
+    var rx0 = Math.max(0, Math.round(ox + tr.x)), ry0 = Math.max(0, Math.round(oy + tr.y));
+    var rx1 = Math.min(w, Math.round(ox + tr.x + tr.w)), ry1 = Math.min(h, Math.round(oy + tr.y + tr.h));
+    for (y = ry0; y < ry1; y++) {
+      for (x = rx0; x < rx1; x++) {
+        oo = (y * w + x) * 4;
+        var fx = 0, fy = 0, fz = 1;
+        // the outer face is the top edge for dorsal tiers, bottom for ventral
+        if (tr.side < 0) { if (y - ry0 < 2) { fy = -0.8; fz = 0.6; } }
+        else             { if (ry1 - 1 - y < 2) { fy = 0.8; fz = 0.6; } }
+        if (x - rx0 < 2) { fx = -0.8; fz = 0.6; }
+        else if (rx1 - 1 - x < 2) { fx = 0.8; fz = 0.6; }
+        var fin = 1 / Math.sqrt(fx * fx + fy * fy + fz * fz);
+        out[oo] = fx * fin * 127 + 128; out[oo + 1] = fy * fin * 127 + 128; out[oo + 2] = fz * fin * 127 + 128;
+      }
+    }
+  }
+  for (i = 0; i < geo.bells.length; i++) {           // concave bells, hot core
+    var bl = geo.bells[i];
+    var bcx = ox + bl.x, bcy = oy + bl.y;
+    var bx0 = Math.max(0, Math.floor(bcx - bl.r)), bx1 = Math.min(w - 1, Math.ceil(bcx + bl.r));
+    var by0 = Math.max(0, Math.floor(bcy - bl.r)), by1 = Math.min(h - 1, Math.ceil(bcy + bl.r));
+    for (y = by0; y <= by1; y++) {
+      for (x = bx0; x <= bx1; x++) {
+        var ddx = bcx - x, ddy = bcy - y;
+        var dr = Math.sqrt(ddx * ddx + ddy * ddy);
+        if (dr > bl.r) continue;
+        oo = (y * w + x) * 4;
+        var cnx = (ddx / bl.r) * 0.8, cny = (ddy / bl.r) * 0.8, cnz = 0.5;
+        var civ = 1 / Math.sqrt(cnx * cnx + cny * cny + cnz * cnz);
+        out[oo] = cnx * civ * 127 + 128; out[oo + 1] = cny * civ * 127 + 128; out[oo + 2] = cnz * civ * 127 + 128;
+        var em = (1 - dr / (bl.r * 0.8)) * 220;
+        if (em > out[oo + 3]) out[oo + 3] = em;
+      }
+    }
+  }
+  for (i = 0; i < geo.ems.length; i++) {             // emissive windows/portholes
+    var es2 = geo.ems[i];
+    var ex0 = Math.max(0, Math.round(ox + es2.x)), ey0 = Math.max(0, Math.round(oy + es2.y));
+    var ex1 = Math.min(w, ex0 + Math.max(1, Math.round(es2.w))), ey1 = Math.min(h, ey0 + Math.max(1, Math.round(es2.h)));
+    var ev = es2.e * 255;
+    for (y = ey0; y < ey1; y++) {
+      for (x = ex0; x < ex1; x++) {
+        oo = (y * w + x) * 4 + 3;
+        if (ev > out[oo]) out[oo] = ev;
+      }
+    }
+  }
+  return out;
+}
+
+/* small static sprites for the GL path */
+var STREAK = (function () {
+  var c = document.createElement("canvas");
+  c.width = 128; c.height = 16;
+  var g = c.getContext("2d");
+  var grd = g.createLinearGradient(0, 0, 128, 0);
+  grd.addColorStop(0, "rgba(255,255,255,0)");
+  grd.addColorStop(0.7, "rgba(255,255,255,0.75)");
+  grd.addColorStop(1, "rgba(255,255,255,1)");
+  g.fillStyle = grd;
+  g.globalAlpha = 0.22; g.fillRect(0, 0, 128, 16);
+  g.globalAlpha = 0.5;  g.fillRect(0, 3, 128, 10);
+  g.globalAlpha = 1;    g.fillRect(0, 6, 128, 4);
+  return c;
+})();
+var WHITE = (function () {
+  var c = document.createElement("canvas");
+  c.width = 8; c.height = 8;
+  var g = c.getContext("2d");
+  g.fillStyle = "#ffffff";
+  g.fillRect(0, 0, 8, 8);
+  return c;
+})();
+
+var GL_VS = [
+  "#version 300 es",
+  "layout(location=0) in vec2 aC;",
+  "layout(location=1) in vec4 aPS;",    // center.xy, size.wh (w<0 == mirrored)
+  "layout(location=2) in vec4 aUV;",
+  "layout(location=3) in vec4 aTint;",
+  "layout(location=4) in vec4 aMisc;",  // rot, mode, ambient, spare
+  "uniform vec2 uRes;",
+  "out vec2 vUV; out vec4 vTint; out vec4 vMisc; out vec2 vPx; out vec2 vRot; out float vFlip;",
+  "void main(){",
+  "  float flip = aPS.z < 0.0 ? -1.0 : 1.0;",
+  "  vec2 sz = vec2(abs(aPS.z), aPS.w);",
+  "  vec2 c = (aC - 0.5) * sz;",
+  "  float cs = cos(aMisc.x);",
+  "  float sn = sin(aMisc.x);",
+  "  vec2 wp = aPS.xy + vec2(c.x*cs - c.y*sn, c.x*sn + c.y*cs);",
+  "  vPx = wp;",
+  "  float ux = flip < 0.0 ? 1.0 - aC.x : aC.x;",
+  "  vUV = mix(aUV.xy, aUV.zw, vec2(ux, aC.y));",
+  "  vTint = aTint; vMisc = aMisc; vRot = vec2(cs, sn); vFlip = flip;",
+  "  vec2 cl = wp / uRes * 2.0 - 1.0;",
+  "  gl_Position = vec4(cl.x, -cl.y, 0.0, 1.0);",
+  "}"
+].join("\n");
+
+var GL_FS = [
+  "#version 300 es",
+  "precision highp float;",
+  "uniform sampler2D uAlb; uniform sampler2D uNrm; uniform sampler2D uBack;",
+  "uniform int uNL; uniform vec4 uLP[24]; uniform vec3 uLC[24];",
+  "uniform float uLZ; uniform vec3 uKey;",
+  "in vec2 vUV; in vec4 vTint; in vec4 vMisc; in vec2 vPx; in vec2 vRot; in float vFlip;",
+  "out vec4 o;",
+  "void main(){",
+  "  float mode = vMisc.y;",
+  "  if (mode > 2.5) { o = vec4(texture(uBack, vUV).rgb, 1.0); return; }",   // backdrop
+  "  vec4 alb = texture(uAlb, vUV);",
+  "  if (mode > 0.5) { o = vec4(alb.rgb * vTint.rgb * vTint.a, 0.0); return; }",  // additive
+  "  vec4 nt = texture(uNrm, vUV);",
+  "  vec3 N = nt.xyz * 2.0 - 1.0;",
+  "  N.x *= vFlip;",
+  "  N = normalize(vec3(N.x*vRot.x - N.y*vRot.y, N.x*vRot.y + N.y*vRot.x, N.z));",
+  "  float amb = vMisc.z;",
+  "  float kd = max(dot(N, uKey), 0.0);",
+  "  vec3 acc = alb.rgb * amb * (0.62 + 0.75 * kd);",   // key light sculpts the quiet state
+  "  for (int i = 0; i < 24; i++) {",
+  "    if (i >= uNL) break;",
+  "    vec3 Ld = vec3(uLP[i].xy - vPx, uLZ);",
+  "    float d2 = dot(Ld, Ld);",
+  "    vec3 L = Ld * inversesqrt(d2);",
+  "    float r2 = uLP[i].z * uLP[i].z;",
+  "    float at = uLP[i].w * r2 / (r2 + 5.0 * d2);",     // inverse-square-ish
+  "    float df = max(dot(N, L), 0.0);",
+  "    vec3 Hv = normalize(L + vec3(0.0, 0.0, 1.0));",
+  "    float sp = pow(max(dot(N, Hv), 0.0), 36.0) * 0.6 * alb.a;",
+  "    acc += (alb.rgb * df + vec3(sp)) * uLC[i] * at;",
+  "  }",
+  "  acc += alb.rgb * nt.a * 1.4;",                      // emissive, unlit
+  "  o = vec4(acc * vTint.rgb * vTint.a, alb.a * vTint.a);",
+  "}"
+].join("\n");
+
+function glCompile(gl, type, srcTxt) {
+  var s = gl.createShader(type);
+  gl.shaderSource(s, srcTxt);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+function initGL() {
+  if (!window.WebGL2RenderingContext) return null;
+  var gc = document.createElement("canvas");
+  gc.style.cssText = "position:fixed;left:0;top:0;width:100vw;height:100vh;display:block;";
+  var gl = gc.getContext("webgl2", { alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: true });
+  if (!gl) return null;
+  var prog;
+  try {
+    prog = gl.createProgram();
+    gl.attachShader(prog, glCompile(gl, gl.VERTEX_SHADER, GL_VS));
+    gl.attachShader(prog, glCompile(gl, gl.FRAGMENT_SHADER, GL_FS));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  } catch (err) { return null; }
+  document.body.appendChild(gc);
+  gc.addEventListener("webglcontextlost", function (ev) {
+    ev.preventDefault();
+    GLR = null;                 // the Canvas 2D path takes over next frame
+    if (gc.parentNode) gc.parentNode.removeChild(gc);
+    resize();
+  });
+  var vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  var qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  var ib = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, ib);
+  gl.bufferData(gl.ARRAY_BUFFER, MAXI * 64, gl.DYNAMIC_DRAW);
+  for (var a = 0; a < 4; a++) {
+    gl.enableVertexAttribArray(1 + a);
+    gl.vertexAttribPointer(1 + a, 4, gl.FLOAT, false, 64, a * 16);
+    gl.vertexAttribDivisor(1 + a, 1);
+  }
+  function mkTex() {
+    var t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  gl.useProgram(prog);
+  var loc = {
+    res: gl.getUniformLocation(prog, "uRes"),
+    nl: gl.getUniformLocation(prog, "uNL"),
+    lp: gl.getUniformLocation(prog, "uLP[0]"),
+    lc: gl.getUniformLocation(prog, "uLC[0]"),
+    lz: gl.getUniformLocation(prog, "uLZ"),
+    key: gl.getUniformLocation(prog, "uKey"),
+    alb: gl.getUniformLocation(prog, "uAlb"),
+    nrm: gl.getUniformLocation(prog, "uNrm"),
+    back: gl.getUniformLocation(prog, "uBack")
+  };
+  gl.uniform1i(loc.alb, 0);
+  gl.uniform1i(loc.nrm, 1);
+  gl.uniform1i(loc.back, 2);
+  gl.uniform3f(loc.key, 0, -0.6, 0.8);   // key light from screen-top
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.disable(gl.DEPTH_TEST);
+  return {
+    gl: gl, gc: gc, prog: prog, vao: vao, ib: ib,
+    texAlb: mkTex(), texNrm: mkTex(), texBack: mkTex(), loc: loc,
+    inst: new Float32Array(MAXI * 16), count: 0,
+    lp: new Float32Array(MAXL * 4), lc: new Float32Array(MAXL * 3), nl: 0,
+    atlas: null
+  };
+}
+
+function packAtlas(items) {
+  items.sort(function (a, b) { return b.h - a.h; });
+  var aw = 1024, i;
+  for (i = 0; i < items.length; i++) aw = Math.max(aw, items[i].w + 2);
+  var x = 1, y = 1, rowH = 0;
+  for (i = 0; i < items.length; i++) {
+    var it = items[i];
+    if (x + it.w + 1 > aw) { x = 1; y += rowH + 1; rowH = 0; }
+    it.x = x; it.y = y;
+    x += it.w + 1;
+    if (it.h > rowH) rowH = it.h;
+  }
+  return { w: aw, h: y + rowH + 1 };
+}
+
+function blitN(dst, dw, sx0, sy0, srcArr, sw2, sh2) {
+  for (var yy = 0; yy < sh2; yy++) {
+    dst.set(srcArr.subarray(yy * sw2 * 4, (yy + 1) * sw2 * 4), ((sy0 + yy) * dw + sx0) * 4);
+  }
+}
+
+function glBuildAtlas() {
+  var R = GLR, gl = R.gl, items = [], i;
+  for (i = 0; i < caps.length; i++) items.push({ key: "cap" + i, cnv: caps[i].sprite, nrm: caps[i].nrm, w: caps[i].sw, h: caps[i].sh });
+  for (i = 0; i < NEAR.length; i++) items.push({ key: "near" + i, cnv: NEAR[i].cnv, nrm: NEAR[i].nrm, w: NEAR[i].cw, h: NEAR[i].ch });
+  var gk = ["order", "entropy", "white", "warm"];
+  for (i = 0; i < 4; i++) items.push({ key: "g_" + gk[i], cnv: GLOW[gk[i]], nrm: null, w: 64, h: 64 });
+  items.push({ key: "streak", cnv: STREAK, nrm: null, w: 128, h: 16 });
+  items.push({ key: "white", cnv: WHITE, nrm: null, w: 8, h: 8 });
+  var dim = packAtlas(items);
+  var ac = document.createElement("canvas");
+  ac.width = dim.w; ac.height = dim.h;
+  var ag = ac.getContext("2d");
+  var nb = new Uint8Array(dim.w * dim.h * 4);
+  for (i = 0; i < nb.length; i += 4) { nb[i] = 128; nb[i + 1] = 128; nb[i + 2] = 255; }
+  R.atlas = {};
+  for (i = 0; i < items.length; i++) {
+    var it = items[i];
+    ag.drawImage(it.cnv, it.x, it.y);
+    if (it.nrm) blitN(nb, dim.w, it.x, it.y, it.nrm, it.w, it.h);
+    R.atlas[it.key] = [it.x / dim.w, it.y / dim.h, (it.x + it.w) / dim.w, (it.y + it.h) / dim.h];
+  }
+  R.atlas.back = [0, 0, 1, 1];
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.bindTexture(gl.TEXTURE_2D, R.texAlb);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, ac);
+  // normal data must NOT be premultiplied (A is an emissive mask, RGB a normal)
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.bindTexture(gl.TEXTURE_2D, R.texNrm);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, dim.w, dim.h, 0, gl.RGBA, gl.UNSIGNED_BYTE, nb);
+}
+
+function glResize() {
+  var R = GLR, gl = R.gl;
+  R.gc.width = Math.ceil(W * dpr);
+  R.gc.height = Math.ceil(H * dpr);
+  gl.viewport(0, 0, R.gc.width, R.gc.height);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+  gl.bindTexture(gl.TEXTURE_2D, R.texBack);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, starCnv);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  glBuildAtlas();
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, R.texAlb);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, R.texNrm);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, R.texBack);
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+/* instance layout: [x,y,w,h, u0,v0,u1,v1, r,g,b,a, rot,mode,amb,0] */
+function pushI(x, y, w2, h2, rot, uv, r, g2, b, a, mode, amb) {
+  var R = GLR;
+  if (R.count >= MAXI) return;
+  var o = R.count * 16;
+  R.count++;
+  var A2 = R.inst;
+  A2[o] = x; A2[o + 1] = y; A2[o + 2] = w2; A2[o + 3] = h2;
+  A2[o + 4] = uv[0]; A2[o + 5] = uv[1]; A2[o + 6] = uv[2]; A2[o + 7] = uv[3];
+  A2[o + 8] = r; A2[o + 9] = g2; A2[o + 10] = b; A2[o + 11] = a;
+  A2[o + 12] = rot; A2[o + 13] = mode; A2[o + 14] = amb; A2[o + 15] = 0;
+}
+
+function addLight(x, y, rad, inten, c) {
+  var R = GLR;
+  if (R.nl >= MAXL) return;
+  var o = R.nl * 4, o3 = R.nl * 3;
+  R.lp[o] = x; R.lp[o + 1] = y; R.lp[o + 2] = rad; R.lp[o + 3] = inten;
+  R.lc[o3] = c[0]; R.lc[o3 + 1] = c[1]; R.lc[o3 + 2] = c[2];
+  R.nl++;
+}
+
+function pushFightersGL(front, tSec) {
+  var A = GLR.atlas;
+  for (var i = 0; i < ftrs.length; i++) {
+    var f = ftrs[i];
+    if (f.front !== front) continue;
+    var fa = Math.min(1, f.fadeIn) * Math.min(1, f.timer * 0.5);
+    if (fa <= 0.02) continue;
+    var guv = A["g_" + f.fac];
+    var idx = f.ti;
+    for (var k = 0; k < 6; k++) {       // tapered trail as soft additive dots
+      var tt = (k + 1) / 6;
+      pushI(f.trail[idx * 2], f.trail[idx * 2 + 1], 2 + 6 * tt, 2 + 6 * tt, 0, guv,
+        1, 1, 1, 0.38 * fa * tt * tt, 1, 0);
+      idx = (idx + 4) % TRAIL;
+    }
+    var back = 4 / (f.spd || 1);
+    pushI(f.x - f.vx * back, f.y - f.vy * back, 7, 7, 0, guv, 1, 1, 1, 0.55 * fa, 1, 0);
+    pushI(f.x, f.y, 12, 12, 0, guv, 1, 1, 1, 0.9 * fa, 1, 0);
+    pushI(f.x, f.y, 2.5, 2.5, 0, A.white, 1, 1, 1, fa, 1, 0);
+  }
+}
+
+function drawGL(tSec) {
+  var R = GLR, gl = R.gl, A = R.atlas, i;
+  R.count = 0; R.nl = 0;
+
+  /* ---- dynamic lights from the sim: explosions > bolts/muzzles > engines ---- */
+  // explosions are the hero moment: fast attack, then a slow fall back to
+  // darkness over the boom's multi-second life, hot enough to flood a hull
+  for (i = 0; i < BOOMS.length; i++) {
+    var lb = BOOMS[i];
+    if (!lb.active) continue;
+    var lpz = lb.age / lb.dur;
+    var env = lpz < 0.12 ? lpz / 0.12 : Math.pow(1 - (lpz - 0.12) / 0.88, 1.5);
+    addLight(lb.x, lb.y, Math.max(lb.r * 6, minDim * 0.12),
+      env * 2.2 * clamp(lb.r / (minDim * 0.02), 0.6, 5), GLOW_RGB[lb.glow]);
+  }
+  // bolts carry their own light; heavy shells add a trailing lobe so the
+  // highlight lingers and visibly rakes along a hull as the shell passes
+  for (i = 0; i < BOLTS.length; i++) {
+    var lbt = BOLTS[i];
+    if (!lbt.active || lbt.delay > 0) continue;
+    var bint = lbt.heavy ? 2.4 : 1.5;
+    addLight(lbt.x, lbt.y, minDim * (lbt.heavy ? 0.10 : 0.075), bint, FRGB[lbt.fac]);
+    if (lbt.heavy) {
+      addLight(lbt.x - lbt.vx * 0.28, lbt.y - lbt.vy * 0.28, minDim * 0.085, bint * 0.5, FRGB[lbt.fac]);
+      if (lbt.age < 0.3) addLight(lbt.sx, lbt.sy, minDim * 0.13, (1 - lbt.age / 0.3) * 2.8, FRGB[lbt.fac]);
+    } else if (lbt.age < 0.12) {
+      addLight(lbt.sx, lbt.sy, minDim * 0.09, (1 - lbt.age / 0.12) * 1.6, FRGB[lbt.fac]);
+    }
+  }
+  for (i = 0; i < caps.length; i++) {
+    var lcp = caps[i];
+    var lca = Math.cos(lcp.ang), lsa = Math.sin(lcp.ang);
+    var lea = (0.16 + 0.4 * lcp.act) * ENG_BOOST;
+    addLight(lcp.x - lca * lcp.len * 0.6, lcp.y - lsa * lcp.len * 0.6,
+      lcp.len * 0.5, lea * 0.9, FRGB[lcp.fac]);
+  }
+
+  /* ---- instances, back to front (one draw preserves this order) ---- */
+  pushI(W / 2, H / 2, W, H, 0, A.back, 1, 1, 1, 1, 3, 0);
+
+  for (i = 0; i < DIST.length; i++) {
+    var dz = DIST[i];
+    var zx = ((((dz.fx + tSec * dz.dvx) % 1) + 1) % 1) * W;
+    pushI(zx + dz.len / 2, dz.fy * H + 0.5, dz.len, 1, 0, A.white, dz.rgb[0], dz.rgb[1], dz.rgb[2], 0.3, 1, 0);
+  }
+  for (i = 0; i < DEB.length; i++) {
+    var dd = DEB[i];
+    var dx2 = (((dd.fx + tSec * dd.dvx) % 1) + 1) % 1;
+    var dy2 = (((dd.fy + tSec * dd.dvy) % 1) + 1) % 1;
+    pushI(dx2 * W, dy2 * H, dd.s, dd.s, 0, A.white, DEBRIS_RGB[0], DEBRIS_RGB[1], DEBRIS_RGB[2], 0.3, 1, 0);
+  }
+
+  pushFightersGL(false, tSec);
+
+  for (i = 0; i < caps.length; i++) {
+    var cap = caps[i];
+    var ca = Math.cos(cap.ang), sa = Math.sin(cap.ang);
+    // ambient 0.7: baked shading recedes, dynamic light sculpts the hull
+    pushI(cap.x, cap.y, cap.sw, cap.sh, cap.ang, A["cap" + i], 1, 1, 1, 1, 0, 0.7);
+    var guv2 = A["g_" + cap.fac];
+    var ea = (0.16 + 0.4 * cap.act) * ENG_BOOST * (0.85 + 0.15 * Math.sin(tSec * 2.1 + cap.dphA));
+    var es = cap.len * 0.055;
+    for (var e = 0; e < cap.eng.length; e += 2) {
+      var ex2 = cap.eng[e], ey2 = cap.eng[e + 1];
+      pushI(cap.x + ca * ex2 - sa * ey2, cap.y + sa * ex2 + ca * ey2,
+        es * 2, es * 2, cap.ang, guv2, 1, 1, 1, ea, 1, 0);
+      var lx2 = ex2 - es;
+      pushI(cap.x + ca * lx2 - sa * ey2, cap.y + sa * lx2 + ca * ey2,
+        es * 2.2, es * 1.7, cap.ang, guv2, 1, 1, 1, ea * 0.5, 1, 0);
+      var lx3 = ex2 - es * 2.1;
+      pushI(cap.x + ca * lx3 - sa * ey2, cap.y + sa * lx3 + ca * ey2,
+        es * 2.6, es * 1.4, cap.ang, guv2, 1, 1, 1, ea * 0.25, 1, 0);
+    }
+    // manoeuvring thrusters puff on the swinging side during the yaw cycle
+    var yawV = Math.cos(tSec * cap.wY + cap.dphY);
+    if (cap.rcs.length && Math.abs(yawV) > 0.55) {
+      var rA = (Math.abs(yawV) - 0.55) * 1.4;
+      var sgn = yawV > 0 ? 1 : -1;
+      for (var rc2 = 0; rc2 < cap.rcs.length; rc2 += 3) {
+        var fore = cap.rcs[rc2] > 0 ? 1 : -1;
+        if (cap.rcs[rc2 + 2] * fore !== sgn) continue;
+        var rpx = cap.rcs[rc2], rpy = cap.rcs[rc2 + 1] + cap.rcs[rc2 + 2] * 3;
+        pushI(cap.x + ca * rpx - sa * rpy, cap.y + sa * rpx + ca * rpy,
+          7, 7, 0, A.g_white, 1, 1, 1, rA * 0.55, 1, 0);
+      }
+    }
+    for (var l = 0; l < cap.lights.length; l++) {
+      var lt = cap.lights[l];
+      var ph = (tSec / lt.per + lt.ph) % 1;
+      if (ph < 0.12) {
+        pushI(cap.x + ca * lt.x - sa * lt.y, cap.y + sa * lt.x + ca * lt.y, 7, 7, 0, guv2, 1, 1, 1, 0.9, 1, 0);
+      }
+    }
+    for (var m = 0; m < cap.embers.length; m += 3) {
+      var ema = 0.2 + 0.45 * Math.abs(Math.sin(tSec * 3 + cap.embers[m + 2]));
+      pushI(cap.x + ca * cap.embers[m] - sa * cap.embers[m + 1],
+        cap.y + sa * cap.embers[m] + ca * cap.embers[m + 1],
+        1.6, 1.6, 0, A.white, EMBER_RGB[0], EMBER_RGB[1], EMBER_RGB[2], ema, 1, 0);
+    }
+  }
+
+  for (i = 0; i < BOOMS.length; i++) {
+    var bm = BOOMS[i];
+    if (!bm.active) continue;
+    var p = bm.age / bm.dur;
+    var a = (p < 0.2 ? p / 0.2 : 1 - (p - 0.2) / 0.8) * 0.8;
+    var rr = bm.r * (0.5 + 0.9 * p);
+    pushI(bm.x, bm.y, rr * 2, rr * 2, 0, A["g_" + bm.glow], 1, 1, 1, a, 1, 0);
+    if (p < 0.3) pushI(bm.x, bm.y, rr * 0.6, rr * 0.6, 0, A.g_white, 1, 1, 1, a * 0.9, 1, 0);
+  }
+
+  // impact debris sparks: short hot streaks thrown from hits and losses
+  for (i = 0; i < SPARKS.length; i++) {
+    var sk = SPARKS[i];
+    if (!sk.active) continue;
+    var sl = Math.max(2, Math.sqrt(sk.vx * sk.vx + sk.vy * sk.vy) * 0.04);
+    pushI(sk.x - sk.vx * 0.02, sk.y - sk.vy * 0.02, sl, 1.4, Math.atan2(sk.vy, sk.vx), A.streak,
+      EMBER_RGB[0], EMBER_RGB[1], EMBER_RGB[2], (1 - sk.age / sk.ttl) * 0.9, 1, 0);
+  }
+
+  for (i = 0; i < SHIMS.length; i++) {
+    var sh = SHIMS[i];
+    if (!sh.active) continue;
+    var sc = caps[sh.cap], o = sc.outline;
+    if (!o) continue;
+    var on = o.length >> 1;
+    var fade = 1 - sh.age / sh.dur;
+    var sca = Math.cos(sc.ang), ssa = Math.sin(sc.ang);
+    var srgb = SHIM_RGB[sc.fac];
+    for (var sg = -9; sg < 9; sg += 2) {
+      var i0 = ((sh.idx + sg) % on + on) % on;
+      var fall = 1 - Math.abs(sg + 0.5) / 9;
+      var oxp = o[i0 * 2], oyp = o[i0 * 2 + 1];
+      pushI(sc.x + sca * oxp - ssa * oyp, sc.y + ssa * oxp + sca * oyp,
+        6, 6, 0, A.g_white, srgb[0], srgb[1], srgb[2], fade * fall * fall * 0.85, 1, 0);
+    }
+    var ix = o[sh.idx * 2], iy = o[sh.idx * 2 + 1];
+    pushI(sc.x + sca * ix - ssa * iy, sc.y + ssa * ix + sca * iy,
+      12, 12, 0, A["g_" + sc.fac], 1, 1, 1, fade * 0.8, 1, 0);
+  }
+
+  // weapon bolts: heavy capital shells (slow, fat, recoil flare) and light
+  // fighter fire — streak sprite oriented along the velocity
+  for (i = 0; i < BOLTS.length; i++) {
+    var b = BOLTS[i];
+    if (!b.active || b.delay > 0) continue;
+    var tl = b.heavy ? 0.26 : 0.16;
+    var blen = Math.sqrt(b.vx * b.vx + b.vy * b.vy) * tl;
+    var rot = Math.atan2(b.vy, b.vx);
+    var brgb = BOLT_RGB[b.fac];
+    var bh = b.heavy ? 8 : 4.2;
+    pushI(b.x - b.vx * tl * 0.5, b.y - b.vy * tl * 0.5, blen, bh, rot, A.streak, brgb[0], brgb[1], brgb[2], 0.9, 1, 0);
+    pushI(b.x - b.vx * tl * 0.3, b.y - b.vy * tl * 0.3, blen * 0.55, bh * 0.36, rot, A.streak, 1, 1, 1, 0.95, 1, 0);
+    var gs = b.heavy ? 13 : 8;
+    pushI(b.x, b.y, gs * 2, gs * 2, 0, A["g_" + b.fac], 1, 1, 1, 0.8, 1, 0);
+    pushI(b.x, b.y, gs, gs, 0, A.g_white, 1, 1, 1, 1, 1, 0);
+    if (b.heavy && b.age < 0.3) {   // recoil-style muzzle flare on main guns
+      var mf = 1 - b.age / 0.3;
+      pushI(b.sx, b.sy, 48, 48, 0, A["g_" + b.fac], 1, 1, 1, mf * 0.9, 1, 0);
+      pushI(b.sx, b.sy, 20, 20, 0, A.g_white, 1, 1, 1, mf, 1, 0);
+    } else if (!b.heavy && b.age < 0.12) {
+      pushI(b.sx, b.sy, 24, 24, 0, A["g_" + b.fac], 1, 1, 1, (1 - b.age / 0.12) * 0.8, 1, 0);
+    }
+  }
+
+  pushFightersGL(true, tSec);
+
+  for (i = 0; i < TWK.length; i++) {
+    var tw = TWK[i];
+    pushI(tw.fx * W, tw.fy * H, 6, 6, 0, A.g_white, 1, 1, 1,
+      0.12 + 0.2 * (0.5 + 0.5 * Math.sin(tSec * tw.w + tw.ph)), 1, 0);
+  }
+
+  // near silhouette: ambient 0.12 keeps it near-black until a bolt or
+  // explosion floods it — the hero reveal of the whole lighting pass
+  for (i = 0; i < NEAR.length; i++) {
+    var ns = NEAR[i];
+    var nx = W * 0.5 + Math.sin(tSec * ns.w + ns.ph) * W * 0.72;
+    var ny = H * ns.yf + Math.sin(tSec * ns.w * 0.6 + ns.ph2) * H * 0.035;
+    pushI(nx, ny, ns.cw * ns.flip, ns.ch, ns.ang, A["near" + i], 1, 1, 1, 1, 0, 0.12);
+    var nca = Math.cos(ns.ang), nsa = Math.sin(ns.ang);
+    for (var nl = 0; nl < 3; nl++) {
+      var lph = (tSec / ns.lper + ns.lights[nl * 3 + 2]) % 1;
+      if (lph < 0.1) {
+        var nlx = ns.lights[nl * 3] * ns.flip, nly = ns.lights[nl * 3 + 1];
+        pushI(nx + nca * nlx - nsa * nly, ny + nsa * nlx + nca * nly,
+          6, 6, 0, A.g_white, 1, 1, 1, 0.8, 1, 0);
+      }
+    }
+  }
+
+  /* ---- one instanced draw ---- */
+  gl.useProgram(R.prog);
+  gl.bindVertexArray(R.vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, R.ib);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, R.inst.subarray(0, R.count * 16));
+  gl.uniform2f(R.loc.res, W, H);
+  gl.uniform1i(R.loc.nl, R.nl);
+  gl.uniform4fv(R.loc.lp, R.lp);
+  gl.uniform3fv(R.loc.lc, R.lc);
+  gl.uniform1f(R.loc.lz, minDim * 0.05);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, R.count);
 }
 
 /* ---------------- main loop (fps-gated) ---------------- */
@@ -1249,7 +1927,8 @@ function tick(now) {
   var dt = Math.min(elapsed / 1000, 0.1);
   var tSec = (now - started) / 1000 + T0;
   update(dt, tSec);
-  draw(tSec);
+  if (GLR) drawGL(tSec);
+  else draw(tSec);
 }
 
 var resizeTimer = 0;
@@ -1258,6 +1937,7 @@ window.addEventListener("resize", function () {
   resizeTimer = window.setTimeout(resize, 150);
 });
 
+try { GLR = initGL(); } catch (eGL) { GLR = null; }
 resize();
 window.requestAnimationFrame(tick);
 
