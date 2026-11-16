@@ -1,0 +1,1267 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ROB64 — Fleet Action</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #030408; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<!-- data.js is optional; when absent the built-in sample below is used.
+     It must set: window.ROB64_DATA = { ... } (see SCHEMA.md) -->
+<script src="data.js"></script>
+<script>
+(function () {
+"use strict";
+
+/* =====================================================================
+   ROB64 fleet-action wallpaper.
+   Canvas 2D, 20 fps cap, seeded PRNG, zero network, zero assets.
+   Data contract: window.ROB64_DATA (see SCHEMA.md). Falls back to SAMPLE.
+   ===================================================================== */
+
+/* ---------------- built-in fallback data ---------------- */
+var SAMPLE = {
+  generated: "2026-11-15T20:40:00-05:00",
+  window: { start: "2026-11-09", end: "2026-11-15" },
+  factions: {
+    order:   { name: "Order",   hue: 200, strength: 0.72 },
+    entropy: { name: "Entropy", hue: 18,  strength: 0.41 }
+  },
+  capitals: [
+    { id: "ord-1", faction: "order",   size: 0.90, integrity: 0.86, activity: 0.70, label: "VIGIL" },
+    { id: "ord-2", faction: "order",   size: 0.55, integrity: 0.93, activity: 0.50, label: "LEDGER" },
+    { id: "ent-1", faction: "entropy", size: 0.75, integrity: 0.58, activity: 0.60, label: "BACKLOG" },
+    { id: "ent-2", faction: "entropy", size: 0.40, integrity: 0.80, activity: 0.30, label: "DRIFT" }
+  ],
+  fighters: [
+    { id: "f01", faction: "order",   speed: 0.70, aggression: 0.80, lifetime: 0.60 },
+    { id: "f02", faction: "order",   speed: 0.55, aggression: 0.60, lifetime: 0.70 },
+    { id: "f03", faction: "order",   speed: 0.80, aggression: 0.70, lifetime: 0.40 },
+    { id: "f04", faction: "order",   speed: 0.45, aggression: 0.40, lifetime: 0.80 },
+    { id: "f05", faction: "order",   speed: 0.65, aggression: 0.75, lifetime: 0.55 },
+    { id: "f06", faction: "order",   speed: 0.60, aggression: 0.50, lifetime: 0.65 },
+    { id: "f07", faction: "order",   speed: 0.72, aggression: 0.66, lifetime: 0.50 },
+    { id: "f08", faction: "order",   speed: 0.50, aggression: 0.35, lifetime: 0.75 },
+    { id: "f09", faction: "entropy", speed: 0.60, aggression: 0.55, lifetime: 0.50 },
+    { id: "f10", faction: "entropy", speed: 0.75, aggression: 0.65, lifetime: 0.45 },
+    { id: "f11", faction: "entropy", speed: 0.40, aggression: 0.30, lifetime: 0.70 },
+    { id: "f12", faction: "entropy", speed: 0.55, aggression: 0.50, lifetime: 0.60 },
+    { id: "f13", faction: "entropy", speed: 0.68, aggression: 0.45, lifetime: 0.55 }
+  ],
+  events: [
+    { t: 0.06, faction: "order",   kind: "launch", magnitude: 0.5 },
+    { t: 0.14, faction: "order",   kind: "strike", magnitude: 0.7 },
+    { t: 0.22, faction: "entropy", kind: "strike", magnitude: 0.4 },
+    { t: 0.31, faction: "entropy", kind: "loss",   magnitude: 0.6 },
+    { t: 0.42, faction: "order",   kind: "strike", magnitude: 0.5 },
+    { t: 0.50, faction: "entropy", kind: "launch", magnitude: 0.4 },
+    { t: 0.58, faction: "entropy", kind: "strike", magnitude: 0.6 },
+    { t: 0.66, faction: "order",   kind: "loss",   magnitude: 0.3 },
+    { t: 0.74, faction: "order",   kind: "strike", magnitude: 0.8 },
+    { t: 0.83, faction: "entropy", kind: "loss",   magnitude: 0.8 },
+    { t: 0.92, faction: "order",   kind: "launch", magnitude: 0.6 }
+  ],
+  metrics: {
+    commits: 23, tasksClosed: 14, tasksOpen: 9,
+    minutesLogged: 420, calendarDensity: 0.55, uptimePct: 0.98
+  }
+};
+
+/* ---------------- helpers ---------------- */
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function num(v, d, a, b) { v = +v; return isFinite(v) ? clamp(v, a, b) : d; }
+function strSeed(s) {
+  s = String(s || "rob64");
+  var h = 2166136261 >>> 0;
+  for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    var t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------------- data intake (defensive) ---------------- */
+var RAW = (window.ROB64_DATA && typeof window.ROB64_DATA === "object") ? window.ROB64_DATA : SAMPLE;
+var SEED = strSeed(RAW.generated);
+var rng = mulberry32(SEED);
+
+function mkFaction(key, defHue) {
+  var src = (RAW.factions && RAW.factions[key]) || {};
+  return {
+    key: key,
+    name: typeof src.name === "string" ? src.name : key,
+    hue: num(src.hue, defHue, 0, 360),
+    strength: num(src.strength, 0.5, 0, 1)
+  };
+}
+var FAC = { order: mkFaction("order", 200), entropy: mkFaction("entropy", 18) };
+
+var MET = (RAW.metrics && typeof RAW.metrics === "object") ? RAW.metrics : {};
+var mCommits = num(MET.commits, 12, 0, 2000);
+var mMinutes = num(MET.minutesLogged, 300, 0, 100000);
+var mCal     = num(MET.calendarDensity, 0.5, 0, 1);
+var mUp      = num(MET.uptimePct, 1, 0, 1);
+var mClosed  = num(MET.tasksClosed, 10, 0, 10000);
+var mOpen    = num(MET.tasksOpen, 10, 0, 10000);
+
+var DEBRIS_N   = Math.round(clamp(mCommits, 6, 40));          // commits -> debris count
+var ENG_BOOST  = 0.6 + 0.6 * clamp(mMinutes / 600, 0, 1);     // minutesLogged -> engine glow
+var BUSY       = 0.6 + 0.8 * mCal;                            // calendarDensity -> fighter busyness
+var STAR_BRIGHT= 0.7 + 0.3 * mUp;                             // uptimePct -> star brightness
+var LIT_BONUS  = { order: 0.2 * clamp(mClosed / 50, 0, 1),    // tasksClosed -> Order lit windows
+                   entropy: 0.2 * clamp(mOpen / 50, 0, 1) };  // tasksOpen -> Entropy lit windows
+
+/* ---- capitals: cap at 4 per side, synthesize one if a side is empty ---- */
+var caps = [];
+function mkCap(fk, size, integ, act, label) {
+  return {
+    fac: fk, size: size, integ: integ, act: act, label: label,
+    seed: (rng() * 4294967296) >>> 0,
+    jPerp: (rng() - 0.5) * 0.05, jAlong: (rng() - 0.5) * 0.10,
+    angDev: (rng() - 0.5) * 0.26,
+    wA: 6.283 / (60 + rng() * 80), wB: 6.283 / (70 + rng() * 90), wY: 6.283 / (90 + rng() * 120),
+    dphA: rng() * 6.283, dphB: rng() * 6.283, dphY: rng() * 6.283,
+    yawAmp: 0.035 + rng() * 0.03,
+    ax: 0, ay: 0, baseAng: 0, len: 10,
+    x: 0, y: 0, ang: 0,
+    sprite: null, sw: 0, sh: 0, outline: null,
+    eng: [], lights: [], embers: [], rcs: []
+  };
+}
+(function intakeCapitals() {
+  var raw = Array.isArray(RAW.capitals) ? RAW.capitals : [];
+  var count = { order: 0, entropy: 0 };
+  for (var i = 0; i < raw.length && caps.length < 8; i++) {
+    var c = raw[i];
+    if (!c) continue;
+    var fk = c.faction === "entropy" ? "entropy" : (c.faction === "order" ? "order" : null);
+    if (!fk || count[fk] >= 4) continue;
+    count[fk]++;
+    caps.push(mkCap(fk,
+      num(c.size, 0.5, 0, 1), num(c.integrity, 1, 0, 1), num(c.activity, 0.5, 0, 1),
+      typeof c.label === "string" ? c.label.slice(0, 12) : ""));
+  }
+  var sides = ["order", "entropy"];
+  for (var s = 0; s < 2; s++) {
+    if (!count[sides[s]]) caps.push(mkCap(sides[s], 0.6, 0.4 + 0.5 * FAC[sides[s]].strength, 0.5, ""));
+  }
+})();
+var CAPF = { order: [], entropy: [] };
+for (var ci = 0; ci < caps.length; ci++) CAPF[caps[ci].fac].push(ci);
+function randCapIdx(fk) { var a = CAPF[fk]; return a[(rng() * a.length) | 0]; }
+
+/* ---- fighters: hard cap 48 instantiated, synthesize from strength if absent ---- */
+var FTR_MAX = 48, TRAIL = 24;
+var ftrs = [];
+function mkFighter(fk, speed, agg, life) {
+  return {
+    fac: fk, spd01: speed, agg: agg, life: life,
+    spd: 40, x: 0, y: 0, vx: 0, vy: 0, wx: 0, wy: 0,
+    mode: 0, tgt: -1, cd: 2 + rng() * 4,
+    timer: 20 + rng() * 60 + life * 120, fadeIn: 1,
+    front: rng() < 0.6,
+    trail: new Float32Array(TRAIL * 2), ti: 0
+  };
+}
+(function intakeFighters() {
+  var raw = Array.isArray(RAW.fighters) ? RAW.fighters : null;
+  if (raw) {
+    for (var i = 0; i < raw.length && ftrs.length < FTR_MAX; i++) {
+      var f = raw[i];
+      if (!f) continue;
+      var fk = f.faction === "entropy" ? "entropy" : (f.faction === "order" ? "order" : null);
+      if (!fk) continue;
+      ftrs.push(mkFighter(fk, num(f.speed, 0.5, 0, 1), num(f.aggression, 0.5, 0, 1), num(f.lifetime, 0.5, 0, 1)));
+    }
+  }
+  if (!ftrs.length) {
+    var sides = ["order", "entropy"];
+    for (var s = 0; s < 2; s++) {
+      var n = Math.round(6 + 16 * FAC[sides[s]].strength);
+      for (var j = 0; j < n && ftrs.length < FTR_MAX; j++) {
+        ftrs.push(mkFighter(sides[s], 0.3 + rng() * 0.6, 0.2 + rng() * 0.7, 0.3 + rng() * 0.6));
+      }
+    }
+  }
+})();
+
+/* ---- events: cap 64, sorted by loop time ---- */
+var EV = [];
+(function intakeEvents() {
+  var raw = Array.isArray(RAW.events) ? RAW.events : [];
+  for (var i = 0; i < raw.length && EV.length < 64; i++) {
+    var e = raw[i];
+    if (!e) continue;
+    EV.push({
+      t: num(e.t, 0, 0, 1),
+      fac: e.faction === "entropy" ? "entropy" : "order",
+      kind: (e.kind === "loss" || e.kind === "launch") ? e.kind : "strike",
+      mag: num(e.magnitude, 0.5, 0, 1)
+    });
+  }
+  EV.sort(function (a, b) { return a.t - b.t; });
+})();
+
+/* ---------------- pre-rendered glow sprites & colors ---------------- */
+function makeGlow(hue, sat) {
+  var s = 64, cv = document.createElement("canvas");
+  cv.width = cv.height = s;
+  var g = cv.getContext("2d");
+  var gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, "hsla(" + hue + "," + sat + "%,88%,1)");
+  gr.addColorStop(0.35, "hsla(" + hue + "," + sat + "%,65%,0.35)");
+  gr.addColorStop(1, "hsla(" + hue + "," + sat + "%,60%,0)");
+  g.fillStyle = gr;
+  g.fillRect(0, 0, s, s);
+  return cv;
+}
+var GLOW = {
+  order: makeGlow(FAC.order.hue, 85),
+  entropy: makeGlow(FAC.entropy.hue, 85),
+  white: makeGlow(0, 0),
+  warm: makeGlow(28, 92)
+};
+var COL = {};
+(function () {
+  var sides = ["order", "entropy"];
+  for (var s = 0; s < 2; s++) {
+    var h = FAC[sides[s]].hue;
+    COL[sides[s]] = {
+      bolt: "hsl(" + h + ",95%,72%)",
+      trail: "hsla(" + h + ",70%,74%,1)",
+      shimmer: "hsla(" + h + ",80%,78%,1)"
+    };
+  }
+})();
+var EMBER_COL = "hsl(22,90%,55%)";
+
+/* ---------------- static ambience (fractional coords, resize-proof) ---------------- */
+var DEB = [];   // drifting debris; pos is a periodic function of time (never wanders off)
+for (var di = 0; di < DEBRIS_N; di++) {
+  DEB.push({
+    fx: rng(), fy: rng(), s: 1 + rng() * 1.2,
+    dvx: (rng() - 0.5) * 0.008, dvy: (rng() - 0.5) * 0.003
+  });
+}
+var TWK = [];   // stars that twinkle dynamically
+for (var ti2 = 0; ti2 < 8; ti2++) {
+  TWK.push({ fx: rng(), fy: rng() * 0.95, w: 0.6 + rng() * 1.4, ph: rng() * 6.283 });
+}
+var DIST = [];  // far depth layer: distant traffic, slow and low-contrast
+for (var zi = 0; zi < 7; zi++) {
+  DIST.push({
+    fx: rng(), fy: 0.05 + rng() * 0.85,
+    len: 2.5 + rng() * 4.5,
+    dvx: (rng() < 0.5 ? -1 : 1) * (0.0008 + rng() * 0.0016),
+    col: "hsla(" + (rng() < 0.5 ? FAC.order.hue : FAC.entropy.hue) + ",18%,62%,1)"
+  });
+}
+
+/* ---------------- pools (fixed size, zero per-frame allocation) ---------------- */
+var BOLTS = [], boltIdx = 0;
+for (var bi = 0; bi < 48; bi++) {
+  BOLTS.push({ active: false, delay: 0, age: 0, ttl: 1, x: 0, y: 0, sx: 0, sy: 0, vx: 0, vy: 0, fac: "order", tcap: -1, heavy: false });
+}
+var BOOMS = [], boomIdx = 0;
+for (var xi = 0; xi < 12; xi++) {
+  BOOMS.push({ active: false, x: 0, y: 0, r: 10, dur: 3, age: 0, glow: "warm" });
+}
+var SHIMS = [], shimIdx = 0;
+for (var si = 0; si < 10; si++) {
+  SHIMS.push({ active: false, cap: 0, age: 0, dur: 1, idx: 0 });
+}
+var SPARKS = [], sparkIdx = 0;
+for (var ski = 0; ski < 36; ski++) {
+  SPARKS.push({ active: false, x: 0, y: 0, vx: 0, vy: 0, age: 0, ttl: 1 });
+}
+
+function spawnBolt(sx, sy, tx, ty, fk, tcap, delay, heavy) {
+  var b = BOLTS[boltIdx]; boltIdx = (boltIdx + 1) % BOLTS.length;
+  var dx = tx - sx, dy = ty - sy, d = Math.sqrt(dx * dx + dy * dy) || 1;
+  var sp = minDim * (heavy ? 0.28 : 0.55);   // heavy shells travel slower, feel heavier
+  b.active = true; b.delay = delay || 0; b.age = 0; b.ttl = d / sp;
+  b.x = sx; b.y = sy; b.sx = sx; b.sy = sy;
+  b.vx = dx / d * sp; b.vy = dy / d * sp;
+  b.fac = fk; b.tcap = (tcap === undefined ? -1 : tcap);
+  b.heavy = !!heavy;
+}
+function spawnSparks(x, y, n) {
+  for (var i = 0; i < n; i++) {
+    var s = SPARKS[sparkIdx]; sparkIdx = (sparkIdx + 1) % SPARKS.length;
+    var a = rng() * 6.283, sp = minDim * (0.04 + rng() * 0.14);
+    s.active = true; s.x = x; s.y = y;
+    s.vx = Math.cos(a) * sp; s.vy = Math.sin(a) * sp;
+    s.age = 0; s.ttl = 0.4 + rng() * 0.5;
+  }
+}
+function spawnBoom(x, y, r, dur, glow) {
+  var e = BOOMS[boomIdx]; boomIdx = (boomIdx + 1) % BOOMS.length;
+  e.active = true; e.x = x; e.y = y; e.r = r; e.dur = dur; e.age = 0; e.glow = glow;
+}
+function spawnShim(capIdx, dur, wx, wy) {
+  var s = SHIMS[shimIdx]; shimIdx = (shimIdx + 1) % SHIMS.length;
+  var c = caps[capIdx], o = c.outline;
+  var best = 0;
+  if (o) {   // nearest silhouette sample to the impact, in ship-local coords
+    var dx = wx - c.x, dy = wy - c.y;
+    var ca = Math.cos(c.ang), sa = Math.sin(c.ang);
+    var lx = dx * ca + dy * sa, ly = -dx * sa + dy * ca;
+    var bd = 1e18;
+    for (var i = 0; i < o.length; i += 2) {
+      var ox = o[i] - lx, oy = o[i + 1] - ly, d2 = ox * ox + oy * oy;
+      if (d2 < bd) { bd = d2; best = i >> 1; }
+    }
+  }
+  s.active = true; s.cap = capIdx; s.age = 0; s.dur = dur; s.idx = best;
+}
+
+/* ---------------- canvas & layout ---------------- */
+var cv = document.getElementById("c");
+var ctx = cv.getContext("2d");
+var starCnv = document.createElement("canvas");
+var W = 2, H = 2, minDim = 2, dpr = 1;
+var ANCH = { order: [0, 0], entropy: [0, 0] };
+var roam = { x: 0, y: 0, w: 1, h: 1 };
+var FIRE_R2 = 1, REACH2 = 1;
+var INITED = false;
+
+function nebBlob(g, x, y, r, hue, a) {
+  var gr = g.createRadialGradient(x, y, 0, x, y, r);
+  gr.addColorStop(0, "hsla(" + hue + ",45%,38%," + a.toFixed(3) + ")");
+  gr.addColorStop(1, "hsla(" + hue + ",45%,38%,0)");
+  g.fillStyle = gr;
+  g.fillRect(x - r, y - r, r * 2, r * 2);
+}
+
+function buildStarfield() {
+  var sr = mulberry32(SEED ^ 0x5f3759df);   // stable across resizes
+  starCnv.width = Math.ceil(W * dpr);
+  starCnv.height = Math.ceil(H * dpr);
+  var g = starCnv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  var bg = g.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, "#0a0f1b");
+  bg.addColorStop(0.6, "#070a13");
+  bg.addColorStop(1, "#05070e");
+  g.fillStyle = bg;
+  g.fillRect(0, 0, W, H);
+  // nebula wash: faction-tinted near each fleet, a brighter core behind the
+  // engagement for contrast, neutral bands filling the whole frame
+  nebBlob(g, ANCH.order[0], ANCH.order[1] - H * 0.08, minDim * 0.6, FAC.order.hue, 0.08 * (0.5 + 0.5 * FAC.order.strength));
+  nebBlob(g, ANCH.entropy[0], ANCH.entropy[1] - H * 0.05, minDim * 0.55, FAC.entropy.hue, 0.08 * (0.5 + 0.5 * FAC.entropy.strength));
+  nebBlob(g, W * 0.5, H * 0.46, minDim * 1.0, 228, 0.06);
+  nebBlob(g, W * 0.2, H * 0.78, minDim * 0.8, 225, 0.035);
+  nebBlob(g, W * 0.82, H * 0.18, minDim * 0.7, 232, 0.04);
+  // distant planet: dim, heavily cropped into the lower-right corner —
+  // something the battle happens NEAR, never the subject of the frame
+  var R = Math.max(W, H) * 1.1;
+  var pcx = W * 0.94, pcy = H + R * 0.915;
+  var pg = g.createRadialGradient(pcx, pcy, R * 0.6, pcx, pcy, R);
+  pg.addColorStop(0, "hsl(222,22%,6%)");
+  pg.addColorStop(0.9, "hsl(221,24%,7%)");
+  pg.addColorStop(1, "hsl(217,26%,10%)");
+  g.fillStyle = pg;
+  g.beginPath();
+  g.arc(pcx, pcy, R, 0, 6.283);
+  g.fill();
+  var ag = g.createRadialGradient(pcx, pcy, R, pcx, pcy, R * 1.015);
+  ag.addColorStop(0, "hsla(206,60%,58%,0.06)");
+  ag.addColorStop(0.4, "hsla(206,60%,56%,0.02)");
+  ag.addColorStop(1, "hsla(206,60%,56%,0)");
+  g.fillStyle = ag;
+  var limbTop = pcy - R * 1.015;
+  g.fillRect(0, limbTop, W, H - limbTop);
+  g.strokeStyle = "hsla(204,70%,66%,0.10)";
+  g.lineWidth = 1;
+  g.beginPath();
+  g.arc(pcx, pcy, R + 0.5, 0, 6.283);
+  g.stroke();
+  var R2 = R * R;
+  // stars (none inside the planet disc)
+  var n = Math.min(900, Math.round(W * H / 3500));
+  for (var i = 0; i < n; i++) {
+    var x = sr() * W, y = sr() * H;
+    var r = 0.3 + sr() * sr() * 1.0;
+    var al = (0.16 + sr() * 0.66) * STAR_BRIGHT;
+    var t = sr();
+    if ((x - pcx) * (x - pcx) + (y - pcy) * (y - pcy) < R2) continue;
+    g.fillStyle = t < 0.12 ? "#ffe9d0" : (t < 0.3 ? "#cfe0ff" : "#dfe8f5");
+    g.globalAlpha = al;
+    g.fillRect(x, y, r * 2, r * 2);
+  }
+  // a few bright foreground stars with faint cross flares
+  for (var b2 = 0; b2 < 6; b2++) {
+    var bx = sr() * W, by = sr() * H * 0.7, br = 1.1 + sr() * 0.9;
+    g.globalAlpha = 0.85 * STAR_BRIGHT;
+    g.fillStyle = "#eef4ff";
+    g.beginPath();
+    g.arc(bx, by, br, 0, 6.283);
+    g.fill();
+    g.globalAlpha = 0.14 * STAR_BRIGHT;
+    g.strokeStyle = "#dfe8f5";
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(bx - br * 5, by); g.lineTo(bx + br * 5, by);
+    g.moveTo(bx, by - br * 5); g.lineTo(bx, by + br * 5);
+    g.stroke();
+  }
+  g.globalAlpha = 1;
+  // soft haze from the screen-top key light, motivating every rim light
+  var kg = g.createLinearGradient(0, 0, 0, H * 0.3);
+  kg.addColorStop(0, "rgba(190,210,240,0.05)");
+  kg.addColorStop(1, "rgba(190,210,240,0)");
+  g.fillStyle = kg;
+  g.fillRect(0, 0, W, H * 0.3);
+  // cinematic vignette: pulls the eye to the engagement, deepens the corners
+  var vg = g.createRadialGradient(W * 0.5, H * 0.46, minDim * 0.45, W * 0.5, H * 0.46, Math.max(W, H) * 0.75);
+  vg.addColorStop(0, "rgba(0,0,0,0)");
+  vg.addColorStop(1, "rgba(0,0,0,0.38)");
+  g.fillStyle = vg;
+  g.fillRect(0, 0, W, H);
+}
+
+/* ---- capital ship sprite: per-faction hull language (Order = slab-sided
+        hammerhead, Entropy = angular needle), axis-symmetric mass with a
+        defined prow, inset dorsal/ventral tier stacks, stern engine cluster,
+        RCS ports, rim light, greebles, window rows — baked once per resize ---- */
+function buildShipSprite(cap) {
+  var sr = mulberry32(cap.seed);
+  var blocky = cap.fac === "order";
+  var L = cap.len, HH = L * (blocky ? 0.30 : 0.21);
+  var pad = Math.ceil(L * 0.10) + 8;
+  var cw = Math.ceil(L) + pad * 2, ch = Math.ceil(HH * 3.4) + pad * 2;
+  var cnv = document.createElement("canvas");
+  cnv.width = cw; cnv.height = ch;
+  var g = cnv.getContext("2d");
+  var hue = FAC[cap.fac].hue;
+  // key light comes from screen-top for every ship; pick which local edge that is
+  var up = Math.cos(cap.baseAng) >= 0 ? -1 : 1;
+  g.translate(pad, ch / 2);          // hull local: x in [0,L] (nose at +x), y about 0
+  function j(a) { return (sr() - 0.5) * a; }
+  function hsl(s, l, a) {
+    return a === undefined ? "hsl(" + hue + "," + s + "%," + l + "%)"
+                           : "hsla(" + hue + "," + s + "%," + l + "%," + a + ")";
+  }
+  // hull half-height profile (×HH) at stations u = x/L, prow at u=1.
+  // dorsal and ventral are near-mirrors (tiny independent jitter only), so
+  // there is no waterline reading — the mass is symmetric about its long axis.
+  var base = blocky
+    ? [[0, 0.50], [0.05, 0.56], [0.10, 0.42], [0.38, 0.46], [0.62, 0.40],
+       [0.80, 0.30], [0.84, 0.52], [0.97, 0.49], [1, 0.30]]   // hammerhead, flat bow face
+    : [[0, 0.42], [0.05, 0.50], [0.11, 0.34], [0.28, 0.40], [0.52, 0.30],
+       [0.74, 0.21], [0.90, 0.12], [1, 0.02]];                // needle taper to a point
+  function jitterCtl() {
+    var out = [];
+    for (var ji = 0; ji < base.length; ji++) {
+      out.push([base[ji][0],
+        base[ji][1] + (ji > 0 && ji < base.length - 1 ? j(0.05) : 0)]);
+    }
+    return out;
+  }
+  var dC = jitterCtl(), vC = jitterCtl();
+  function prof(ctl, u) {
+    for (var i = 1; i < ctl.length; i++) {
+      if (u <= ctl[i][0]) {
+        var a = ctl[i - 1], b = ctl[i];
+        return a[1] + (b[1] - a[1]) * ((u - a[0]) / ((b[0] - a[0]) || 1));
+      }
+    }
+    return ctl[ctl.length - 1][1];
+  }
+  var NS = 26, sx = [], sd = [], sv = [];
+  for (var st = 0; st <= NS; st++) {
+    var u = st / NS;
+    sx.push(u * L); sd.push(-HH * prof(dC, u)); sv.push(HH * prof(vC, u));
+  }
+  // main hull, lit from the screen-up side
+  var hgrad = g.createLinearGradient(0, up * HH * 0.7, 0, -up * HH * 0.7);
+  hgrad.addColorStop(0, hsl(11, 21));
+  hgrad.addColorStop(0.45, hsl(10, 13));
+  hgrad.addColorStop(1, hsl(12, 7));
+  g.fillStyle = hgrad;
+  g.beginPath();
+  g.moveTo(sx[NS], sd[NS]);
+  for (var h1 = NS - 1; h1 >= 0; h1--) g.lineTo(sx[h1], sd[h1]);
+  for (var h2 = 0; h2 <= NS; h2++) g.lineTo(sx[h2], sv[h2]);
+  g.closePath();
+  g.fill();
+  function dY(u) { return -HH * prof(dC, u); }
+  function vY(u) { return HH * prof(vC, u); }
+  // the prow announces a front
+  if (blocky) {
+    // hammerhead cheek plates and a lit armoured bow face
+    g.fillStyle = hsl(10, 10);
+    g.beginPath();
+    g.moveTo(L * 0.84, dY(0.84)); g.lineTo(L, dY(1)); g.lineTo(L, dY(1) + HH * 0.16);
+    g.lineTo(L * 0.86, dY(0.86) + HH * 0.14); g.closePath(); g.fill();
+    g.beginPath();
+    g.moveTo(L * 0.84, vY(0.84)); g.lineTo(L, vY(1)); g.lineTo(L, vY(1) - HH * 0.16);
+    g.lineTo(L * 0.86, vY(0.86) - HH * 0.14); g.closePath(); g.fill();
+    g.strokeStyle = "rgba(220,234,252,0.5)";
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(L, dY(1)); g.lineTo(L, vY(1)); g.stroke();
+  } else {
+    // needle leading edges converge on the point
+    g.strokeStyle = hsl(30, 45, 0.45);
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(L * 0.52, dY(0.52)); g.lineTo(L, 0); g.lineTo(L * 0.52, vY(0.52));
+    g.stroke();
+  }
+  // stepped tier assemblies set INTO the hull: a dorsal stack plus a smaller
+  // ventral stack at a different station — never a lone conning tower
+  cap.lights.length = 0;
+  function tierStack(side, u0, wFrac, nT) {
+    var x0 = L * u0, w0 = L * wFrac;
+    var um = (x0 + w0 / 2) / L;
+    var ty = (side < 0 ? dY(um) : vY(um)) * 0.78;   // base sits inside the mass
+    for (var tr = 0; tr < nT; tr++) {
+      var tw2 = w0 * (1 - tr * 0.28), th2 = HH * (0.13 + sr() * 0.05);
+      var tx2 = x0 + (w0 - tw2) * (0.25 + sr() * 0.5);
+      g.fillStyle = hsl(9, 15 - tr * 2);
+      if (side < 0) { g.fillRect(tx2, ty - th2, tw2, th2 + 1); ty -= th2; }
+      else          { g.fillRect(tx2, ty - 1, tw2, th2 + 1); ty += th2; }
+      g.fillStyle = "rgba(210,224,240,0.75)";
+      for (var wv = tx2 + 2; wv < tx2 + tw2 - 2; wv += 4) {
+        if (sr() < 0.6) g.fillRect(wv, side < 0 ? ty + 2 : ty - 3, 1, 1);
+      }
+    }
+    return { x0: x0, w0: w0, ty: ty };
+  }
+  var uD = (blocky ? 0.30 : 0.22) + sr() * 0.10;
+  var dTop = tierStack(-1, uD, blocky ? 0.16 : 0.13, 2 + Math.floor(sr() * 2));
+  tierStack(1, uD + 0.18 + sr() * 0.10, 0.10, 1 + Math.floor(sr() * 2));
+  // antenna masts off the dorsal stack
+  g.strokeStyle = hsl(8, 26, 0.8);
+  g.lineWidth = 1;
+  var nm = 1 + Math.floor(sr() * 2);
+  for (var am = 0; am < nm; am++) {
+    var ax2 = dTop.x0 + sr() * dTop.w0, ah2 = HH * (0.2 + sr() * 0.25);
+    g.beginPath(); g.moveTo(ax2, dTop.ty); g.lineTo(ax2, dTop.ty - ah2); g.stroke();
+    if (am === 0) cap.lights.push({ x: ax2 - L / 2, y: dTop.ty - ah2, per: 1.6 + sr() * 3, ph: sr() });
+  }
+  // manoeuvring thruster ports fore and aft, dorsal + ventral (fired live during yaw)
+  cap.rcs.length = 0;
+  for (var rc = 0; rc < 2; rc++) {
+    var ru = (rc ? 0.80 : 0.14) + j(0.04);
+    cap.rcs.push(L * ru - L / 2, dY(ru) + 1, -1);
+    cap.rcs.push(L * ru - L / 2, vY(ru) - 1, 1);
+    g.fillStyle = hsl(10, 20);
+    g.fillRect(L * ru - 1.5, dY(ru) - 1, 3, 2);
+    g.fillRect(L * ru - 1.5, vY(ru) - 1, 3, 2);
+  }
+  // panel seams at a fixed ~15–21 px pitch, so larger hulls subdivide more
+  g.strokeStyle = "rgba(0,0,0,0.3)";
+  g.lineWidth = 1;
+  var pitch = 15 + sr() * 6;
+  for (var px2 = L * 0.10; px2 < L * 0.96; px2 += pitch) {
+    var uu = px2 / L;
+    g.beginPath();
+    g.moveTo(px2, -HH * prof(dC, uu) + 1);
+    g.lineTo(px2 + j(3), HH * prof(vC, uu) - 1);
+    g.stroke();
+  }
+  // subtle plating tone patches (no long lateral seam — that read as a waterline)
+  for (var pp = 0; pp < Math.round(L / 26); pp++) {
+    g.fillStyle = sr() < 0.5 ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.08)";
+    g.fillRect(L * (0.08 + sr() * 0.8), (sr() - 0.5) * HH * 0.6, 6 + sr() * pitch, 2 + sr() * 5);
+  }
+  // sensor blisters on the hull edges
+  g.fillStyle = hsl(12, 18);
+  for (var sb = 0; sb < 3; sb++) {
+    var sbx = L * (0.2 + sr() * 0.6);
+    var sby = (sr() < 0.5 ? -1 : 1) * HH * prof(sr() < 0.5 ? dC : vC, sbx / L) * 0.85;
+    g.beginPath(); g.arc(sbx, sby, 1.5 + sr() * 2, 0, 6.283); g.fill();
+  }
+  // window rows at a fixed ~5 px spacing along the whole hull (the scale cue);
+  // activity closes/open gaps between banks, integrity (+ metrics) sets lit fraction
+  var litFrac = clamp(0.30 + 0.55 * cap.integ + LIT_BONUS[cap.fac], 0, 1);
+  var gapFrac = clamp(0.42 - 0.28 * cap.act, 0.1, 0.5);
+  var rows = L > 230 ? 3 : 2;
+  for (var rw = 0; rw < rows; rw++) {
+    var ry = (rw - (rows - 1) / 2) * HH * 0.30 + j(HH * 0.05);
+    for (var wx2 = L * 0.08; wx2 < L * 0.95; wx2 += 5) {
+      var sIdx = Math.round(wx2 / L * NS);
+      var lim = Math.min(-sd[sIdx], sv[sIdx]);
+      if (Math.abs(ry) > lim * 0.8) continue;
+      if (sr() < gapFrac) continue;
+      if (sr() < litFrac) {
+        g.fillStyle = sr() < 0.85 ? "rgba(215,228,242,0.85)" : hsl(80, 70);
+        g.globalAlpha = 0.55 + sr() * 0.45;
+      } else {
+        g.fillStyle = "rgba(90,100,115,0.35)";
+        g.globalAlpha = 0.6;
+      }
+      g.fillRect(wx2, ry, 1.4, 1);
+    }
+  }
+  g.globalAlpha = 1;
+  // stern engine cluster: blocky hulls pack more, smaller bells; needles mount
+  // fewer, larger ones (plume drawn live)
+  var ne = blocky ? 3 + Math.floor(sr() * 2) : 2 + Math.floor(sr() * 2);
+  cap.eng.length = 0;
+  var rb = Math.min(HH * 0.18, HH * 0.9 / ((ne - 1) * 2.3 + 2));
+  for (var e = 0; e < ne; e++) {
+    var ey = (e - (ne - 1) / 2) * rb * 2.3;
+    g.fillStyle = hsl(8, 10);
+    g.beginPath(); g.arc(-rb * 0.4, ey, rb, 0, 6.283); g.fill();
+    var cg = g.createRadialGradient(-rb * 0.5, ey, 0, -rb * 0.5, ey, rb * 0.8);
+    cg.addColorStop(0, "hsla(" + hue + ",85%,85%,0.95)");
+    cg.addColorStop(0.5, "hsla(" + hue + ",80%,60%,0.5)");
+    cg.addColorStop(1, "hsla(" + hue + ",80%,55%,0)");
+    g.fillStyle = cg;
+    g.beginPath(); g.arc(-rb * 0.5, ey, rb * 0.8, 0, 6.283); g.fill();
+    cap.eng.push(-L / 2 - rb * 0.5, ey);
+  }
+  // painted fleet glyph blocks near the bow, derived from the label (never text)
+  var gr = mulberry32(strSeed(cap.label || "hull"));
+  g.globalAlpha = 0.5;
+  g.fillStyle = hsl(60, 55);
+  var gx = L * (blocky ? 0.68 : 0.52), nGly = 2 + Math.floor(gr() * 3);
+  for (var gy2 = 0; gy2 < nGly; gy2++) {
+    var gw2 = 2 + gr() * 4;
+    g.fillRect(gx, -1.5, gw2, 3);
+    gx += gw2 + 2 + gr() * 3;
+  }
+  g.globalAlpha = 1;
+  // hard rim light along the key-lit (screen-up) edge: soft pass + hard pass
+  var rimD = up < 0;
+  for (var rp = 0; rp < 2; rp++) {
+    g.strokeStyle = rp ? "rgba(225,238,255,0.75)" : "rgba(205,222,245,0.2)";
+    g.lineWidth = rp ? 1 : 2.5;
+    g.beginPath();
+    g.moveTo(sx[1], rimD ? sd[1] : sv[1]);
+    for (var r1 = 2; r1 <= NS; r1++) g.lineTo(sx[r1], rimD ? sd[r1] : sv[r1]);
+    g.stroke();
+  }
+  if (rimD) {   // the dorsal tier stack catches the key light too
+    g.strokeStyle = "rgba(215,230,250,0.5)";
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(dTop.x0, dTop.ty);
+    g.lineTo(dTop.x0 + dTop.w0 * 0.72, dTop.ty);
+    g.stroke();
+  }
+  // nav lights at the extremities
+  cap.lights.push({ x: L / 2 - 2, y: 0, per: 2.2 + sr() * 2, ph: sr() });
+  cap.lights.push({ x: -L / 2 + 2, y: sd[0] + 1, per: 1.8 + sr() * 2.5, ph: sr() });
+  cap.lights.push({ x: -L / 2 + 2, y: sv[0] - 1, per: 2.6 + sr() * 2, ph: sr() });
+  // silhouette samples in centered coords, for hull-conforming shield arcs
+  cap.outline = new Float32Array((NS + 1) * 4);
+  var oi = 0;
+  for (var o1 = NS; o1 >= 0; o1--) { cap.outline[oi++] = sx[o1] - L / 2; cap.outline[oi++] = sd[o1]; }
+  for (var o2 = 0; o2 <= NS; o2++) { cap.outline[oi++] = sx[o2] - L / 2; cap.outline[oi++] = sv[o2]; }
+  // damage embers (positions only; flicker drawn live)
+  var nEmber = Math.round((1 - cap.integ) * 7);
+  cap.embers.length = 0;
+  for (var m = 0; m < nEmber; m++) {
+    cap.embers.push(L * (0.1 + sr() * 0.8) - L / 2, (sr() - 0.5) * HH * 0.5, sr() * 6.283);
+  }
+  cap.sprite = cnv; cap.sw = cw; cap.sh = ch;
+}
+
+/* ---- near-field silhouettes: enormous hulls crossing very close to camera,
+        with a real rim light, grazed surface, portholes and running lights ---- */
+var NEAR = [];
+function buildNearSprites() {
+  NEAR.length = 0;
+  for (var i = 0; i < 2; i++) {
+    var nr = mulberry32(SEED ^ (0x517cc1b7 + i * 101));
+    var len = minDim * (0.6 + i * 0.5), hh = len * 0.14;
+    var cw = Math.ceil(len) + 6, ch = Math.ceil(hh * 3.2) + 6;
+    var cnv = document.createElement("canvas");
+    cnv.width = cw; cnv.height = ch;
+    var g = cnv.getContext("2d");
+    g.translate(3, ch / 2);
+    function nj(a) { return (nr() - 0.5) * a; }
+    // chiselled silhouette: wedge prow, dorsal fin, mast root, engine block aft
+    var top = [
+      [1, -0.08], [0.86 + nj(0.04), -0.5], [0.64, -(0.58 + nj(0.08))],
+      [0.60, -1.05], [0.46 + nj(0.05), -1.05], [0.43, -0.62],
+      [0.18, -(0.70 + nj(0.08))], [0.15, -0.92], [0.10, -0.92], [0, -0.55]
+    ];
+    var bot = [
+      [0, 0.6], [0.2 + nj(0.06), 0.78], [0.55, 0.72 + nj(0.08)],
+      [0.78, 0.42], [0.95, 0.3], [1, 0.08]
+    ];
+    var fill = g.createLinearGradient(0, -hh * 1.3, 0, hh);
+    fill.addColorStop(0, "hsl(218,14%,9%)");    // the key light grazing the top
+    fill.addColorStop(0.18, "hsl(220,15%,4%)");
+    fill.addColorStop(1, "hsl(222,16%,2%)");
+    g.fillStyle = fill;
+    g.beginPath();
+    g.moveTo(len * top[0][0], hh * top[0][1]);
+    for (var v = 1; v < top.length; v++) g.lineTo(len * top[v][0], hh * top[v][1]);
+    for (var v2 = 0; v2 < bot.length; v2++) g.lineTo(len * bot[v2][0], hh * bot[v2][1]);
+    g.closePath();
+    g.fill();
+    // surface hints only where the light grazes the upper hull; recessed bays stay subtle
+    g.fillStyle = "rgba(170,190,215,0.035)";
+    for (var pp = 0; pp < 4; pp++) {
+      g.fillRect(len * (0.1 + nr() * 0.75), -hh * (0.52 + nr() * 0.25), len * (0.03 + nr() * 0.06), hh * 0.10);
+    }
+    g.fillStyle = "rgba(0,0,0,0.35)";
+    for (var qq = 0; qq < 4; qq++) {
+      g.fillRect(len * (0.15 + nr() * 0.7), hh * (0.05 + nr() * 0.4), len * (0.03 + nr() * 0.06), hh * 0.12);
+    }
+    // real rim light along the key-lit edge: soft pass, then a hard pass
+    for (var rp = 0; rp < 2; rp++) {
+      g.strokeStyle = rp ? "rgba(215,232,252,0.55)" : "rgba(195,215,240,0.16)";
+      g.lineWidth = rp ? 1.2 : 3.5;
+      g.beginPath();
+      g.moveTo(len * top[0][0], hh * top[0][1]);
+      for (var rv = 1; rv < top.length; rv++) g.lineTo(len * top[rv][0], hh * top[rv][1]);
+      g.stroke();
+    }
+    // dim porthole rows — inhabited, not a cutout
+    g.fillStyle = "rgba(190,205,228,0.16)";
+    for (var p2 = 0; p2 < 14; p2++) {
+      g.fillRect(len * (0.08 + nr() * 0.84), (nr() - 0.3) * hh * 0.7, 1.6, 1.6);
+    }
+    // faint warm engine slits at the stern
+    g.fillStyle = "hsla(" + (nr() < 0.5 ? FAC.order.hue : FAC.entropy.hue) + ",60%,60%,0.25)";
+    for (var eb = 0; eb < 3; eb++) g.fillRect(1, -hh * 0.3 + eb * hh * 0.28, 2.5, hh * 0.14);
+    // running lights blink live (sprite-centered coords)
+    var lights = new Float32Array(9);
+    var lu = [1.0, 0.60, 0.15], lv = [-0.08, -1.02, -0.90];
+    for (var lt = 0; lt < 3; lt++) {
+      lights[lt * 3] = len * lu[lt] + 3 - cw / 2;
+      lights[lt * 3 + 1] = hh * lv[lt];
+      lights[lt * 3 + 2] = nr();
+    }
+    NEAR.push({
+      cnv: cnv, cw: cw, ch: ch,
+      w: 6.283 / (460 + i * 320), ph: nr() * 6.283, ph2: nr() * 6.283,
+      ang: (nr() - 0.5) * 0.24, yf: i === 0 ? 0.16 : 0.72,
+      flip: nr() < 0.5 ? -1 : 1,
+      lights: lights, lper: 1.8 + nr() * 1.6
+    });
+  }
+}
+
+function layoutCapitals() {
+  var land = W >= H;
+  // full-frame composition: fleets on a diagonal, fighters roam nearly everywhere
+  if (land) {
+    ANCH.order[0] = W * 0.26; ANCH.order[1] = H * 0.38;
+    ANCH.entropy[0] = W * 0.74; ANCH.entropy[1] = H * 0.58;
+    roam.x = W * 0.05; roam.y = H * 0.06; roam.w = W * 0.90; roam.h = H * 0.78;
+  } else {
+    ANCH.order[0] = W * 0.58; ANCH.order[1] = H * 0.22;
+    ANCH.entropy[0] = W * 0.44; ANCH.entropy[1] = H * 0.60;
+    roam.x = W * 0.08; roam.y = H * 0.06; roam.w = W * 0.84; roam.h = H * 0.80;
+  }
+  var sides = ["order", "entropy"];
+  for (var s = 0; s < 2; s++) {
+    var fk = sides[s], other = sides[1 - s];
+    var ax = ANCH[fk][0], ay = ANCH[fk][1];
+    var dir = Math.atan2(ANCH[other][1] - ay, ANCH[other][0] - ax);
+    var pxd = -Math.sin(dir), pyd = Math.cos(dir);
+    var idxs = CAPF[fk];
+    for (var i = 0; i < idxs.length; i++) {
+      var cap = caps[idxs[i]];
+      var off = (i - (idxs.length - 1) / 2) * 0.17 * minDim + cap.jPerp * minDim;
+      var along = cap.jAlong * minDim;
+      cap.ax = ax + pxd * off + Math.cos(dir) * along;
+      cap.ay = ay + pyd * off + Math.sin(dir) * along;
+      cap.baseAng = dir + cap.angDev;
+      cap.len = minDim * (0.11 + 0.16 * cap.size);
+      cap.x = cap.ax; cap.y = cap.ay; cap.ang = cap.baseAng;
+      buildShipSprite(cap);
+    }
+  }
+}
+
+function pickRoam(f) {
+  var px = roam.x + rng() * roam.w, py = roam.y + rng() * roam.h;
+  f.wx = px * 0.65 + ANCH[f.fac][0] * 0.35;
+  f.wy = py * 0.65 + ANCH[f.fac][1] * 0.35;
+  f.mode = 0; f.tgt = -1;
+}
+function pickWaypoint(f) {
+  if (rng() < clamp(0.18 + 0.45 * f.agg * BUSY, 0, 0.8)) {
+    var enemy = f.fac === "order" ? "entropy" : "order";
+    var tIdx = randCapIdx(enemy), c = caps[tIdx];
+    f.wx = c.x + (rng() - 0.5) * c.len * 2.2;
+    f.wy = c.y + (rng() - 0.5) * c.len * 1.2;
+    f.mode = 1; f.tgt = tIdx;
+  } else {
+    pickRoam(f);
+  }
+}
+function respawnFighter(f, cap) {
+  f.x = cap.x; f.y = cap.y;
+  f.front = rng() < 0.6;
+  f.vx = Math.cos(cap.ang) * f.spd * 0.5;
+  f.vy = Math.sin(cap.ang) * f.spd * 0.5;
+  f.fadeIn = 0;
+  f.timer = 30 + f.life * 150;
+  for (var k = 0; k < TRAIL; k++) { f.trail[k * 2] = f.x; f.trail[k * 2 + 1] = f.y; }
+  pickWaypoint(f);
+}
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  W = Math.max(2, window.innerWidth);
+  H = Math.max(2, window.innerHeight);
+  cv.width = Math.ceil(W * dpr);
+  cv.height = Math.ceil(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  minDim = Math.min(W, H);
+  FIRE_R2 = Math.pow(minDim * 0.35, 2);
+  REACH2 = Math.pow(minDim * 0.03 + 8, 2);
+  layoutCapitals();
+  buildStarfield();
+  buildNearSprites();
+  for (var i = 0; i < ftrs.length; i++) {
+    var f = ftrs[i];
+    f.spd = minDim * (0.06 + 0.11 * f.spd01);
+    if (!INITED) {
+      var c = caps[randCapIdx(f.fac)];
+      f.x = c.x + (rng() - 0.5) * minDim * 0.2;
+      f.y = c.y + (rng() - 0.5) * minDim * 0.15;
+      for (var k = 0; k < TRAIL; k++) { f.trail[k * 2] = f.x; f.trail[k * 2 + 1] = f.y; }
+      pickWaypoint(f);
+    }
+  }
+  INITED = true;
+}
+
+/* ---------------- events ---------------- */
+function fireEvent(e) {
+  var enemy = e.fac === "order" ? "entropy" : "order";
+  if (e.kind === "strike") {
+    // heavy main-gun volley: few fat shells, really spaced in time, on
+    // parallel-but-offset paths so they never read as a dashed line
+    var src = caps[randCapIdx(e.fac)];
+    var tIdx = randCapIdx(enemy), tgt = caps[tIdx];
+    var n = 1 + Math.round(e.mag * 2);
+    var bdx = tgt.x - src.x, bdy = tgt.y - src.y;
+    var bd = Math.sqrt(bdx * bdx + bdy * bdy) || 1;
+    var pxn = -bdy / bd, pyn = bdx / bd;
+    for (var i = 0; i < n; i++) {
+      var off = (i - (n - 1) / 2) * src.len * 0.22 + (rng() - 0.5) * src.len * 0.08;
+      spawnBolt(
+        src.x + Math.cos(src.ang) * src.len * 0.45 + pxn * off,
+        src.y + Math.sin(src.ang) * src.len * 0.45 + pyn * off,
+        tgt.x + pxn * off * 0.6 + (rng() - 0.5) * tgt.len * 0.3,
+        tgt.y + pyn * off * 0.6 + (rng() - 0.5) * tgt.len * 0.15,
+        e.fac, tIdx, i * (0.55 + rng() * 0.35), true);
+    }
+  } else if (e.kind === "loss") {
+    var cIdx = randCapIdx(e.fac), c = caps[cIdx];
+    var lbx = c.x + (rng() - 0.5) * c.len * 0.6;
+    var lby = c.y + (rng() - 0.5) * c.len * 0.25;
+    spawnBoom(lbx, lby, minDim * (0.02 + 0.09 * e.mag), 2.5 + 3.5 * e.mag, "warm");
+    spawnSparks(lbx, lby, 6 + Math.round(e.mag * 5));
+    spawnShim(cIdx, 0.5, lbx, lby);
+  } else { // launch
+    var lIdx = randCapIdx(e.fac), lc = caps[lIdx];
+    spawnBoom(lc.x, lc.y, minDim * 0.012, 1.0, e.fac);
+    var want = 1 + Math.round(e.mag * 3), got = 0;
+    for (var k = 0; k < ftrs.length && got < want; k++) {
+      if (ftrs[k].fac === e.fac) { respawnFighter(ftrs[k], lc); got++; }
+    }
+  }
+}
+
+/* ---------------- simulation ---------------- */
+var LOOP = 150;                 // seconds per event loop
+var prevLoopT = 0, evIdx = 0;
+var nextAmb = 25 + rng() * 50;  // ambient distant explosions
+
+function update(dt, tSec) {
+  var loopT = (tSec % LOOP) / LOOP;
+  if (loopT < prevLoopT) evIdx = 0;
+  while (evIdx < EV.length && EV[evIdx].t <= loopT) { fireEvent(EV[evIdx]); evIdx++; }
+  prevLoopT = loopT;
+
+  if (tSec >= nextAmb) {
+    nextAmb = tSec + 35 + rng() * 70;
+    spawnBoom(roam.x + rng() * roam.w, roam.y + rng() * roam.h * 0.8,
+      minDim * (0.008 + rng() * 0.02), 2 + rng() * 3, "white");
+  }
+
+  // capitals: bounded periodic drift + slow yaw (safe for weeks of uptime)
+  var ampA = minDim * 0.012, i, cap;
+  for (i = 0; i < caps.length; i++) {
+    cap = caps[i];
+    cap.x = cap.ax + Math.sin(tSec * cap.wA + cap.dphA) * ampA;
+    cap.y = cap.ay + Math.sin(tSec * cap.wB + cap.dphB) * ampA * 0.8;
+    cap.ang = cap.baseAng + Math.sin(tSec * cap.wY + cap.dphY) * cap.yawAmp;
+  }
+
+  // fighters
+  for (i = 0; i < ftrs.length; i++) {
+    var f = ftrs[i];
+    f.timer -= dt;
+    if (f.timer <= 0) respawnFighter(f, caps[randCapIdx(f.fac)]);
+    if (f.fadeIn < 1) f.fadeIn = Math.min(1, f.fadeIn + dt * 0.7);
+    var dx = f.wx - f.x, dy = f.wy - f.y;
+    var d2 = dx * dx + dy * dy;
+    if (d2 < REACH2) {
+      pickWaypoint(f);
+      dx = f.wx - f.x; dy = f.wy - f.y; d2 = dx * dx + dy * dy;
+    }
+    var d = Math.sqrt(d2) || 1;
+    var turn = Math.min(1, (1.1 + f.agg * 1.8) * dt);   // limited turn rate -> banking arcs
+    f.vx += (dx / d * f.spd - f.vx) * turn;
+    f.vy += (dy / d * f.spd - f.vy) * turn;
+    f.x += f.vx * dt;
+    f.y += f.vy * dt;
+    if (f.x < roam.x || f.x > roam.x + roam.w || f.y < roam.y || f.y > roam.y + roam.h) pickRoam(f);
+    f.trail[f.ti * 2] = f.x;
+    f.trail[f.ti * 2 + 1] = f.y;
+    f.ti = (f.ti + 1) % TRAIL;
+    // strafing fire
+    if (f.mode === 1 && f.tgt >= 0) {
+      var c2 = caps[f.tgt];
+      var ex = c2.x - f.x, ey = c2.y - f.y;
+      if (ex * ex + ey * ey < FIRE_R2) {
+        f.cd -= dt * BUSY;
+        if (f.cd <= 0) {
+          f.cd = 2.6 + (1 - f.agg) * 5;
+          spawnBolt(f.x, f.y,
+            c2.x + (rng() - 0.5) * c2.len * 0.4,
+            c2.y + (rng() - 0.5) * c2.len * 0.2,
+            f.fac, f.tgt, 0);
+        }
+      }
+    }
+  }
+
+  // bolts
+  for (i = 0; i < BOLTS.length; i++) {
+    var b = BOLTS[i];
+    if (!b.active) continue;
+    if (b.delay > 0) { b.delay -= dt; continue; }
+    b.age += dt;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    if (b.age >= b.ttl) {
+      b.active = false;
+      spawnBoom(b.x, b.y, minDim * (b.heavy ? 0.030 : 0.012), b.heavy ? 1.6 : 0.8, b.fac);
+      spawnSparks(b.x, b.y, b.heavy ? 8 : 4);
+      if (b.tcap >= 0) spawnShim(b.tcap, 0.35 + rng() * 0.15, b.x, b.y);
+    }
+  }
+  // explosions, shimmers & debris sparks
+  for (i = 0; i < BOOMS.length; i++) {
+    if (BOOMS[i].active && (BOOMS[i].age += dt) >= BOOMS[i].dur) BOOMS[i].active = false;
+  }
+  for (i = 0; i < SHIMS.length; i++) {
+    if (SHIMS[i].active && (SHIMS[i].age += dt) >= SHIMS[i].dur) SHIMS[i].active = false;
+  }
+  for (i = 0; i < SPARKS.length; i++) {
+    var sk = SPARKS[i];
+    if (!sk.active) continue;
+    sk.age += dt;
+    if (sk.age >= sk.ttl) { sk.active = false; continue; }
+    sk.x += sk.vx * dt; sk.y += sk.vy * dt;
+    sk.vx *= 1 - 2.2 * dt; sk.vy *= 1 - 2.2 * dt;
+  }
+}
+
+/* ---------------- render ---------------- */
+function drawFighters(front, tSec) {
+  for (var i = 0; i < ftrs.length; i++) {
+    var f = ftrs[i];
+    if (f.front !== front) continue;
+    var fa = Math.min(1, f.fadeIn) * Math.min(1, f.timer * 0.5);
+    if (fa <= 0.02) continue;
+    // tapered additive trail, oldest -> newest, in 6 width/alpha chunks
+    ctx.strokeStyle = COL[f.fac].trail;
+    var idx = f.ti, step = 0;
+    var px = f.trail[idx * 2], py = f.trail[idx * 2 + 1];
+    for (var c2 = 0; c2 < 6; c2++) {
+      var tt = (c2 + 1) / 6;
+      ctx.globalAlpha = 0.7 * fa * tt * tt;
+      ctx.lineWidth = 0.5 + 1.6 * tt;
+      ctx.beginPath();
+      ctx.moveTo(px, py);
+      for (var k = 0; k < 4 && step < TRAIL - 1; k++, step++) {
+        idx = (idx + 1) % TRAIL;
+        px = f.trail[idx * 2]; py = f.trail[idx * 2 + 1];
+        ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    }
+    // engine glow just behind the nose, then the hot nose itself
+    var back = 4 / (f.spd || 1);
+    ctx.globalAlpha = 0.55 * fa;
+    ctx.drawImage(GLOW[f.fac], f.x - f.vx * back - 3.5, f.y - f.vy * back - 3.5, 7, 7);
+    ctx.globalAlpha = 0.9 * fa;
+    ctx.drawImage(GLOW[f.fac], f.x - 6, f.y - 6, 12, 12);
+    ctx.globalAlpha = fa;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(f.x - 1.25, f.y - 1.25, 2.5, 2.5);
+  }
+}
+
+function draw(tSec) {
+  ctx.drawImage(starCnv, 0, 0, W, H);
+  var i;
+
+  // far depth layer: distant traffic, slow and low-contrast
+  ctx.globalAlpha = 0.3;
+  for (i = 0; i < DIST.length; i++) {
+    var dz = DIST[i];
+    var zx = ((((dz.fx + tSec * dz.dvx) % 1) + 1) % 1) * W;
+    ctx.fillStyle = dz.col;
+    ctx.fillRect(zx, dz.fy * H, dz.len, 1);
+  }
+  ctx.globalAlpha = 1;
+
+  // debris: slow specks, position is periodic in time
+  ctx.fillStyle = "#434b59";
+  ctx.globalAlpha = 0.3;
+  for (i = 0; i < DEB.length; i++) {
+    var dd = DEB[i];
+    var dx2 = (((dd.fx + tSec * dd.dvx) % 1) + 1) % 1;
+    var dy2 = (((dd.fy + tSec * dd.dvy) % 1) + 1) % 1;
+    ctx.fillRect(dx2 * W, dy2 * H, dd.s, dd.s);
+  }
+  ctx.globalAlpha = 1;
+
+  // fighters passing behind the capital line
+  ctx.globalCompositeOperation = "lighter";
+  drawFighters(false, tSec);
+  ctx.globalCompositeOperation = "source-over";
+  ctx.globalAlpha = 1;
+
+  // capital ships
+  for (i = 0; i < caps.length; i++) {
+    var cap = caps[i];
+    ctx.save();
+    ctx.translate(cap.x, cap.y);
+    ctx.rotate(cap.ang);
+    ctx.drawImage(cap.sprite, -cap.sw / 2, -cap.sh / 2);
+    ctx.globalCompositeOperation = "lighter";
+    // engine glow with a plume trailing aft
+    var gl = GLOW[cap.fac];
+    var ea = (0.16 + 0.4 * cap.act) * ENG_BOOST * (0.85 + 0.15 * Math.sin(tSec * 2.1 + cap.dphA));
+    var es = cap.len * 0.055;
+    for (var e = 0; e < cap.eng.length; e += 2) {
+      var ex2 = cap.eng[e], ey2 = cap.eng[e + 1];
+      ctx.globalAlpha = ea;
+      ctx.drawImage(gl, ex2 - es, ey2 - es, es * 2, es * 2);
+      ctx.globalAlpha = ea * 0.5;
+      ctx.drawImage(gl, ex2 - es * 2.1, ey2 - es * 0.85, es * 2.2, es * 1.7);
+      ctx.globalAlpha = ea * 0.25;
+      ctx.drawImage(gl, ex2 - es * 3.4, ey2 - es * 0.7, es * 2.6, es * 1.4);
+    }
+    // manoeuvring thrusters puff on the swinging side during the yaw cycle
+    var yawV = Math.cos(tSec * cap.wY + cap.dphY);
+    if (cap.rcs.length && Math.abs(yawV) > 0.55) {
+      var rA = (Math.abs(yawV) - 0.55) * 1.4;
+      var sgn = yawV > 0 ? 1 : -1;
+      for (var rc2 = 0; rc2 < cap.rcs.length; rc2 += 3) {
+        var fore = cap.rcs[rc2] > 0 ? 1 : -1;
+        if (cap.rcs[rc2 + 2] * fore !== sgn) continue;
+        ctx.globalAlpha = rA * 0.55;
+        ctx.drawImage(GLOW.white,
+          cap.rcs[rc2] - 3.5, cap.rcs[rc2 + 1] + cap.rcs[rc2 + 2] * 3 - 3.5, 7, 7);
+      }
+    }
+    // blinking running lights
+    for (var l = 0; l < cap.lights.length; l++) {
+      var lt = cap.lights[l];
+      var ph = (tSec / lt.per + lt.ph) % 1;
+      if (ph < 0.12) {
+        ctx.globalAlpha = 0.9;
+        ctx.drawImage(gl, lt.x - 3.5, lt.y - 3.5, 7, 7);
+      }
+    }
+    // damage embers flicker
+    if (cap.embers.length) {
+      ctx.fillStyle = EMBER_COL;
+      for (var m = 0; m < cap.embers.length; m += 3) {
+        ctx.globalAlpha = 0.2 + 0.45 * Math.abs(Math.sin(tSec * 3 + cap.embers[m + 2]));
+        ctx.fillRect(cap.embers[m], cap.embers[m + 1], 1.5, 1.5);
+      }
+    }
+    ctx.restore();
+  }
+
+  ctx.globalCompositeOperation = "lighter";
+
+  // explosions
+  for (i = 0; i < BOOMS.length; i++) {
+    var bm = BOOMS[i];
+    if (!bm.active) continue;
+    var p = bm.age / bm.dur;
+    var a = (p < 0.2 ? p / 0.2 : 1 - (p - 0.2) / 0.8) * 0.8;
+    var rr = bm.r * (0.5 + 0.9 * p);
+    ctx.globalAlpha = a;
+    ctx.drawImage(GLOW[bm.glow], bm.x - rr, bm.y - rr, rr * 2, rr * 2);
+    if (p < 0.3) {
+      ctx.globalAlpha = a * 0.9;
+      ctx.drawImage(GLOW.white, bm.x - rr * 0.3, bm.y - rr * 0.3, rr * 0.6, rr * 0.6);
+    }
+  }
+
+  // impact debris sparks: short hot streaks thrown from hits and losses
+  ctx.strokeStyle = EMBER_COL;
+  ctx.lineWidth = 1.2;
+  for (i = 0; i < SPARKS.length; i++) {
+    var sk = SPARKS[i];
+    if (!sk.active) continue;
+    ctx.globalAlpha = (1 - sk.age / sk.ttl) * 0.9;
+    ctx.beginPath();
+    ctx.moveTo(sk.x - sk.vx * 0.04, sk.y - sk.vy * 0.04);
+    ctx.lineTo(sk.x, sk.y);
+    ctx.stroke();
+  }
+
+  // shield hits: a short arc conforming to the hull near the impact point,
+  // bright at the impact, falling off along the silhouette, gone in ~400 ms
+  for (i = 0; i < SHIMS.length; i++) {
+    var sh = SHIMS[i];
+    if (!sh.active) continue;
+    var sc = caps[sh.cap], o = sc.outline;
+    if (!o) continue;
+    var on = o.length >> 1;
+    var fade = 1 - sh.age / sh.dur;
+    ctx.save();
+    ctx.translate(sc.x, sc.y);
+    ctx.rotate(sc.ang);
+    ctx.strokeStyle = COL[sc.fac].shimmer;
+    ctx.lineWidth = 2;
+    for (var sg = -9; sg < 9; sg++) {
+      var i0 = ((sh.idx + sg) % on + on) % on;
+      var i1 = ((sh.idx + sg + 1) % on + on) % on;
+      var fall = 1 - Math.abs(sg + 0.5) / 9;
+      ctx.globalAlpha = fade * fall * fall * 0.85;
+      ctx.beginPath();
+      ctx.moveTo(o[i0 * 2], o[i0 * 2 + 1]);
+      ctx.lineTo(o[i1 * 2], o[i1 * 2 + 1]);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = fade * 0.8;
+    ctx.drawImage(GLOW[sc.fac], o[sh.idx * 2] - 6, o[sh.idx * 2 + 1] - 6, 12, 12);
+    ctx.restore();
+  }
+
+  // weapon bolts: heavy capital shells (slow, fat, recoil flare) and light
+  // fighter fire — a white-hot core makes a travelling bolt the brightest
+  // thing on screen
+  for (i = 0; i < BOLTS.length; i++) {
+    var b = BOLTS[i];
+    if (!b.active || b.delay > 0) continue;
+    var bw = b.heavy ? 4.2 : 2.2;
+    var tl = b.heavy ? 0.20 : 0.13;
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = COL[b.fac].bolt;
+    ctx.lineWidth = bw * 1.9;
+    ctx.beginPath();
+    ctx.moveTo(b.x - b.vx * tl, b.y - b.vy * tl);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = bw * 0.7;
+    ctx.beginPath();
+    ctx.moveTo(b.x - b.vx * tl * 0.6, b.y - b.vy * tl * 0.6);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    var gs = b.heavy ? 13 : 8;
+    ctx.globalAlpha = 0.8;
+    ctx.drawImage(GLOW[b.fac], b.x - gs, b.y - gs, gs * 2, gs * 2);
+    ctx.globalAlpha = 1;
+    ctx.drawImage(GLOW.white, b.x - gs * 0.5, b.y - gs * 0.5, gs, gs);
+    if (b.heavy && b.age < 0.3) {   // recoil-style muzzle flare on main guns
+      var mf = 1 - b.age / 0.3;
+      ctx.globalAlpha = mf * 0.9;
+      ctx.drawImage(GLOW[b.fac], b.sx - 24, b.sy - 24, 48, 48);
+      ctx.globalAlpha = mf;
+      ctx.drawImage(GLOW.white, b.sx - 10, b.sy - 10, 20, 20);
+    } else if (!b.heavy && b.age < 0.12) {
+      ctx.globalAlpha = (1 - b.age / 0.12) * 0.8;
+      ctx.drawImage(GLOW[b.fac], b.sx - 12, b.sy - 12, 24, 24);
+    }
+  }
+
+  // fighters passing in front of the capital line
+  drawFighters(true, tSec);
+
+  // twinkling stars
+  for (i = 0; i < TWK.length; i++) {
+    var tw = TWK[i];
+    ctx.globalAlpha = 0.12 + 0.2 * (0.5 + 0.5 * Math.sin(tSec * tw.w + tw.ph));
+    ctx.drawImage(GLOW.white, tw.fx * W - 3, tw.fy * H - 3, 6, 6);
+  }
+
+  ctx.globalCompositeOperation = "source-over";
+  ctx.globalAlpha = 1;
+
+  // near depth layer: dark silhouettes drifting across, occluding everything
+  for (i = 0; i < NEAR.length; i++) {
+    var ns = NEAR[i];
+    var nx = W * 0.5 + Math.sin(tSec * ns.w + ns.ph) * W * 0.75;
+    var ny = H * ns.yf + Math.sin(tSec * ns.w * 0.6 + ns.ph2) * H * 0.035;
+    ctx.save();
+    ctx.translate(nx, ny);
+    ctx.rotate(ns.ang);
+    ctx.scale(ns.flip, 1);
+    ctx.drawImage(ns.cnv, -ns.cw / 2, -ns.ch / 2);
+    ctx.globalCompositeOperation = "lighter";
+    for (var nl = 0; nl < 3; nl++) {
+      var lph = (tSec / ns.lper + ns.lights[nl * 3 + 2]) % 1;
+      if (lph < 0.1) {
+        ctx.globalAlpha = 0.8;
+        ctx.drawImage(GLOW.white, ns.lights[nl * 3] - 3, ns.lights[nl * 3 + 1] - 3, 6, 6);
+      }
+    }
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+}
+
+/* ---------------- main loop (fps-gated) ---------------- */
+var FPS = 20, T0 = 0;
+try {
+  var qs = new URLSearchParams(window.location.search);
+  var qf = parseFloat(qs.get("fps"));
+  if (isFinite(qf)) FPS = clamp(qf, 1, 60);
+  var qt = parseFloat(qs.get("t"));         // debug: start the clock at t seconds
+  if (isFinite(qt)) T0 = clamp(qt, 0, 1e6);
+} catch (err) { /* ignore */ }
+var FRAME_MS = 1000 / FPS;
+var last = 0, started = 0;
+
+function tick(now) {
+  window.requestAnimationFrame(tick);
+  if (!started) { started = now; last = now; return; }
+  var elapsed = now - last;
+  if (elapsed < FRAME_MS - 1) return;
+  last = now - (elapsed % FRAME_MS);
+  var dt = Math.min(elapsed / 1000, 0.1);
+  var tSec = (now - started) / 1000 + T0;
+  update(dt, tSec);
+  draw(tSec);
+}
+
+var resizeTimer = 0;
+window.addEventListener("resize", function () {
+  window.clearTimeout(resizeTimer);
+  resizeTimer = window.setTimeout(resize, 150);
+});
+
+resize();
+window.requestAnimationFrame(tick);
+
+})();
+</script>
+</body>
+</html>
