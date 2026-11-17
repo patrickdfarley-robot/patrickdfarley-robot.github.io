@@ -238,7 +238,13 @@ var GLOW = {
   order: makeGlow(FAC.order.hue, 85),
   entropy: makeGlow(FAC.entropy.hue, 85),
   white: makeGlow(0, 0),
-  warm: makeGlow(28, 92)
+  warm: makeGlow(16, 92),           // explosions: hot red-orange beside red weapons fire
+  red: makeGlow(5, 95)              // all weapons fire, both factions
+};
+// fighters read as hot near-white points with only a suggestion of faction hue
+var FGLOW = {
+  order: makeGlow(FAC.order.hue, 22),
+  entropy: makeGlow(FAC.entropy.hue, 22)
 };
 var COL = {};
 (function () {
@@ -246,20 +252,23 @@ var COL = {};
   for (var s = 0; s < 2; s++) {
     var h = FAC[sides[s]].hue;
     COL[sides[s]] = {
-      bolt: "hsl(" + h + ",95%,72%)",
-      trail: "hsla(" + h + ",70%,74%,1)",
+      trail: "hsla(" + h + ",20%,82%,1)",
       shimmer: "hsla(" + h + ",80%,78%,1)"
     };
   }
 })();
+var BOLT_COL = "hsl(5,95%,58%)";    // red body under the white-hot core
 var EMBER_COL = "hsl(22,90%,55%)";
 /* linear-ish RGB triples for the WebGL lit path */
 var FRGB = { order: hsl2rgb(FAC.order.hue, 0.9, 0.65), entropy: hsl2rgb(FAC.entropy.hue, 0.9, 0.65) };
-var BOLT_RGB = { order: hsl2rgb(FAC.order.hue, 0.95, 0.72), entropy: hsl2rgb(FAC.entropy.hue, 0.95, 0.72) };
+var FTR_RGB = { order: hsl2rgb(FAC.order.hue, 0.25, 0.82), entropy: hsl2rgb(FAC.entropy.hue, 0.25, 0.82) };
+var BOLT_RGB = hsl2rgb(5, 0.95, 0.58);
+var BOLT_LIGHT_RGB = hsl2rgb(5, 0.9, 0.55);
 var SHIM_RGB = { order: hsl2rgb(FAC.order.hue, 0.8, 0.78), entropy: hsl2rgb(FAC.entropy.hue, 0.8, 0.78) };
-var WARM_RGB = hsl2rgb(28, 0.92, 0.6);
+var WARM_RGB = hsl2rgb(16, 0.92, 0.58);
 var EMBER_RGB = hsl2rgb(22, 0.9, 0.55);
-var GLOW_RGB = { warm: WARM_RGB, white: [1, 1, 1], order: FRGB.order, entropy: FRGB.entropy };
+var RED_RGB = hsl2rgb(5, 0.95, 0.6);
+var GLOW_RGB = { warm: WARM_RGB, white: [1, 1, 1], red: RED_RGB, order: FRGB.order, entropy: FRGB.entropy };
 var DEBRIS_RGB = [0.26, 0.29, 0.35];
 
 /* ---------------- static ambience (fractional coords, resize-proof) ---------------- */
@@ -382,31 +391,97 @@ function buildStarfield() {
   nebBlob(g, W * 0.56, H * 0.42, minDim * 1.0, 228, 0.06);
   nebBlob(g, W * 0.2, H * 0.78, minDim * 0.8, 225, 0.035);
   nebBlob(g, W * 0.82, H * 0.18, minDim * 0.7, 232, 0.04);
-  // distant planet: a quiet limb arc rising out of the lower-right corner —
+  // distant planet: a limb arc rising out of the lower-right corner —
   // something the battle happens NEAR, never the subject of the frame. (The
   // near hull owns the lower-left, so the planet keeps clear of it.)
+  // Lit by the screen-top key (biased a little right so the terminator falls
+  // inside the frame): bright limb upper-right, sinking to near-black toward
+  // the lower-left, with low-contrast banding so it reads as a world.
   var R = Math.max(W, H) * 1.1;
   var pcx = W * 1.02, pcy = H + R * 0.80;
-  var pg = g.createRadialGradient(pcx, pcy, R * 0.6, pcx, pcy, R);
-  pg.addColorStop(0, "hsl(222,24%,8%)");
-  pg.addColorStop(0.9, "hsl(221,26%,10%)");
-  pg.addColorStop(1, "hsl(217,30%,15%)");
-  g.fillStyle = pg;
+  var LX = 0.62, LY = -0.785;                 // unit vector toward the key light
+  var plx = pcx + LX * R, ply = pcy + LY * R; // lit point on the limb (offscreen right)
+  g.save();
   g.beginPath();
   g.arc(pcx, pcy, R, 0, 6.283);
-  g.fill();
-  var ag = g.createRadialGradient(pcx, pcy, R, pcx, pcy, R * 1.02);
-  ag.addColorStop(0, "hsla(206,60%,58%,0.13)");
-  ag.addColorStop(0.4, "hsla(206,60%,56%,0.045)");
-  ag.addColorStop(1, "hsla(206,60%,56%,0)");
-  g.fillStyle = ag;
-  var limbTop = pcy - R * 1.02;
-  g.fillRect(0, limbTop, W, H - limbTop);
-  g.strokeStyle = "hsla(204,70%,68%,0.22)";
-  g.lineWidth = 1;
-  g.beginPath();
-  g.arc(pcx, pcy, R + 0.5, 0, 6.283);
-  g.stroke();
+  g.clip();
+  // base crust
+  g.fillStyle = "hsl(219,25%,19%)";
+  g.fillRect(0, 0, W, H);
+  // large-scale banding, concentric with the limb, quiet contrast
+  g.lineCap = "round";
+  for (var pb = 0; pb < 8; pb++) {
+    var brad = R * (0.70 + 0.33 * sr());
+    g.lineWidth = R * (0.018 + 0.05 * sr());
+    g.strokeStyle = "hsla(" + Math.round(208 + sr() * 26) + ",24%," +
+      Math.round(12 + sr() * 24) + "%," + (0.14 + sr() * 0.12).toFixed(3) + ")";
+    g.beginPath();
+    g.arc(pcx, pcy, brad, -2.7, -1.2);
+    g.stroke();
+  }
+  // continental / cloud mottling breaking up the bands
+  for (var pm = 0; pm < 10; pm++) {
+    var mth = -2.55 + sr() * 1.25, mrr = R * (0.80 + 0.19 * sr());
+    var mx = pcx + Math.cos(mth) * mrr, my = pcy + Math.sin(mth) * mrr;
+    var mr = R * (0.03 + 0.09 * sr());
+    var mg = g.createRadialGradient(mx, my, 0, mx, my, mr);
+    var ml = sr() < 0.5;   // half lighter patches, half darker
+    mg.addColorStop(0, ml ? "hsla(215,18%,36%," + (0.08 + sr() * 0.08).toFixed(3) + ")"
+                          : "hsla(226,24%,7%," + (0.10 + sr() * 0.09).toFixed(3) + ")");
+    mg.addColorStop(1, "hsla(220,20%,20%,0)");
+    g.fillStyle = mg;
+    g.fillRect(mx - mr, my - mr, mr * 2, mr * 2);
+  }
+  // terminator: shade away from the lit limb point into near-black
+  var tg = g.createRadialGradient(plx, ply, 0, plx, ply, R * 2);
+  tg.addColorStop(0, "rgba(2,3,8,0)");
+  tg.addColorStop(0.32, "rgba(2,3,8,0.06)");
+  tg.addColorStop(0.48, "rgba(2,3,8,0.45)");
+  tg.addColorStop(0.64, "rgba(2,3,8,0.84)");
+  tg.addColorStop(1, "rgba(2,3,8,0.95)");
+  g.fillStyle = tg;
+  g.fillRect(0, 0, W, H);
+  // cool daylight wash on the lit side
+  g.globalCompositeOperation = "lighter";
+  var lw = g.createRadialGradient(plx, ply, 0, plx, ply, R * 1.5);
+  lw.addColorStop(0, "hsla(214,48%,60%,0.32)");
+  lw.addColorStop(0.5, "hsla(216,42%,52%,0.11)");
+  lw.addColorStop(1, "hsla(216,40%,50%,0)");
+  g.fillStyle = lw;
+  g.fillRect(0, 0, W, H);
+  g.globalCompositeOperation = "source-over";
+  g.restore();
+  // limb pass, per segment: atmospheric rim light scaled by how much the key
+  // grazes that point, and a dark feather so the night-side edge stays soft
+  g.lineCap = "round";
+  var SEG = 64, th0 = -2.55, th1 = -1.35, dth = (th1 - th0) / SEG;
+  for (var ps = 0; ps <= SEG; ps++) {
+    var th = th0 + dth * ps;
+    var lit = Math.cos(th) * LX - Math.sin(th) * (-LY);
+    lit = lit > 0 ? lit * lit : 0;    // squared: tight bright arc near grazing
+    var a0 = th - dth * 0.62, a1 = th + dth * 0.62;
+    if (lit > 0.004) {
+      g.strokeStyle = "hsla(205,88%,78%," + Math.min(1, lit * 1.4).toFixed(3) + ")";
+      g.lineWidth = 2.2;
+      g.beginPath(); g.arc(pcx, pcy, R - 0.4, a0, a1); g.stroke();
+      g.strokeStyle = "hsla(206,75%,64%," + (lit * 0.42).toFixed(3) + ")";
+      g.lineWidth = 7;
+      g.beginPath(); g.arc(pcx, pcy, R + 1.5, a0, a1); g.stroke();
+      g.strokeStyle = "hsla(207,68%,58%," + (lit * 0.16).toFixed(3) + ")";
+      g.lineWidth = 18;
+      g.beginPath(); g.arc(pcx, pcy, R + 5.5, a0, a1); g.stroke();
+      g.strokeStyle = "hsla(208,60%,55%," + (lit * 0.07).toFixed(3) + ")";
+      g.lineWidth = 38;
+      g.beginPath(); g.arc(pcx, pcy, R + 14, a0, a1); g.stroke();
+    }
+    var dk = (1 - Math.min(1, lit * 3)) * 0.45;
+    if (dk > 0.01) {                  // feather the unlit silhouette into the sky
+      g.strokeStyle = "hsla(222,30%,4%," + dk.toFixed(3) + ")";
+      g.lineWidth = 6;
+      g.beginPath(); g.arc(pcx, pcy, R, a0, a1); g.stroke();
+    }
+  }
+  g.lineCap = "butt";
   var R2 = R * R;
   // stars (none inside the planet disc)
   var n = Math.min(900, Math.round(W * H / 3500));
@@ -1005,7 +1080,7 @@ function fireEvent(e) {
     spawnShim(cIdx, 0.5, lbx, lby);
   } else { // launch
     var lIdx = randCapIdx(e.fac), lc = caps[lIdx];
-    spawnBoom(lc.x, lc.y, minDim * 0.012, 1.0, e.fac);
+    spawnBoom(lc.x, lc.y, minDim * 0.012, 1.0, e.fac);   // launch flash keeps faction hue (it's the carrier, not a shot)
     var want = 1 + Math.round(e.mag * 3), got = 0;
     for (var k = 0; k < ftrs.length && got < want; k++) {
       if (ftrs[k].fac === e.fac) { respawnFighter(ftrs[k], lc); got++; }
@@ -1088,7 +1163,7 @@ function update(dt, tSec) {
     b.y += b.vy * dt;
     if (b.age >= b.ttl) {
       b.active = false;
-      spawnBoom(b.x, b.y, minDim * (b.heavy ? 0.030 : 0.012), b.heavy ? 1.6 : 0.8, b.fac);
+      spawnBoom(b.x, b.y, minDim * (b.heavy ? 0.030 : 0.012), b.heavy ? 1.6 : 0.8, "red");
       spawnSparks(b.x, b.y, b.heavy ? 8 : 4);
       if (b.tcap >= 0) spawnShim(b.tcap, 0.35 + rng() * 0.15, b.x, b.y);
     }
@@ -1137,9 +1212,9 @@ function drawFighters(front, tSec) {
     // engine glow just behind the nose, then the hot nose itself
     var back = 4 / (f.spd || 1);
     ctx.globalAlpha = 0.55 * fa;
-    ctx.drawImage(GLOW[f.fac], f.x - f.vx * back - 3.5, f.y - f.vy * back - 3.5, 7, 7);
+    ctx.drawImage(FGLOW[f.fac], f.x - f.vx * back - 3.5, f.y - f.vy * back - 3.5, 7, 7);
     ctx.globalAlpha = 0.9 * fa;
-    ctx.drawImage(GLOW[f.fac], f.x - 6, f.y - 6, 12, 12);
+    ctx.drawImage(FGLOW[f.fac], f.x - 6, f.y - 6, 12, 12);
     ctx.globalAlpha = fa;
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(f.x - 1.25, f.y - 1.25, 2.5, 2.5);
@@ -1299,7 +1374,7 @@ function draw(tSec) {
     var bw = b.heavy ? 4.2 : 2.2;
     var tl = b.heavy ? 0.26 : 0.16;
     ctx.globalAlpha = 0.85;
-    ctx.strokeStyle = COL[b.fac].bolt;
+    ctx.strokeStyle = BOLT_COL;
     ctx.lineWidth = bw * 1.9;
     ctx.beginPath();
     ctx.moveTo(b.x - b.vx * tl, b.y - b.vy * tl);
@@ -1314,18 +1389,18 @@ function draw(tSec) {
     ctx.stroke();
     var gs = b.heavy ? 13 : 8;
     ctx.globalAlpha = 0.8;
-    ctx.drawImage(GLOW[b.fac], b.x - gs, b.y - gs, gs * 2, gs * 2);
+    ctx.drawImage(GLOW.red, b.x - gs, b.y - gs, gs * 2, gs * 2);
     ctx.globalAlpha = 1;
     ctx.drawImage(GLOW.white, b.x - gs * 0.5, b.y - gs * 0.5, gs, gs);
     if (b.heavy && b.age < 0.3) {   // recoil-style muzzle flare on main guns
       var mf = 1 - b.age / 0.3;
       ctx.globalAlpha = mf * 0.9;
-      ctx.drawImage(GLOW[b.fac], b.sx - 24, b.sy - 24, 48, 48);
+      ctx.drawImage(GLOW.red, b.sx - 24, b.sy - 24, 48, 48);
       ctx.globalAlpha = mf;
       ctx.drawImage(GLOW.white, b.sx - 10, b.sy - 10, 20, 20);
     } else if (!b.heavy && b.age < 0.12) {
       ctx.globalAlpha = (1 - b.age / 0.12) * 0.8;
-      ctx.drawImage(GLOW[b.fac], b.sx - 12, b.sy - 12, 24, 24);
+      ctx.drawImage(GLOW.red, b.sx - 12, b.sy - 12, 24, 24);
     }
   }
 
@@ -1703,8 +1778,8 @@ function glBuildAtlas() {
   var R = GLR, gl = R.gl, items = [], i;
   for (i = 0; i < caps.length; i++) items.push({ key: "cap" + i, cnv: caps[i].sprite, nrm: caps[i].nrm, w: caps[i].sw, h: caps[i].sh });
   for (i = 0; i < NEAR.length; i++) items.push({ key: "near" + i, cnv: NEAR[i].cnv, nrm: NEAR[i].nrm, w: NEAR[i].cw, h: NEAR[i].ch });
-  var gk = ["order", "entropy", "white", "warm"];
-  for (i = 0; i < 4; i++) items.push({ key: "g_" + gk[i], cnv: GLOW[gk[i]], nrm: null, w: 64, h: 64 });
+  var gk = ["order", "entropy", "white", "warm", "red"];
+  for (i = 0; i < gk.length; i++) items.push({ key: "g_" + gk[i], cnv: GLOW[gk[i]], nrm: null, w: 64, h: 64 });
   items.push({ key: "streak", cnv: STREAK, nrm: null, w: 128, h: 16 });
   items.push({ key: "white", cnv: WHITE, nrm: null, w: 8, h: 8 });
   var dim = packAtlas(items);
@@ -1775,17 +1850,18 @@ function pushFightersGL(front, tSec) {
     if (f.front !== front) continue;
     var fa = Math.min(1, f.fadeIn) * Math.min(1, f.timer * 0.5);
     if (fa <= 0.02) continue;
-    var guv = A["g_" + f.fac];
+    // near-white glow with a faint faction tint (white glow sprite × tint)
+    var frgb = FTR_RGB[f.fac];
     var idx = f.ti;
     for (var k = 0; k < 6; k++) {       // tapered trail as soft additive dots
       var tt = (k + 1) / 6;
-      pushI(f.trail[idx * 2], f.trail[idx * 2 + 1], 2 + 6 * tt, 2 + 6 * tt, 0, guv,
-        1, 1, 1, 0.38 * fa * tt * tt, 1, 0);
+      pushI(f.trail[idx * 2], f.trail[idx * 2 + 1], 2 + 6 * tt, 2 + 6 * tt, 0, A.g_white,
+        frgb[0], frgb[1], frgb[2], 0.38 * fa * tt * tt, 1, 0);
       idx = (idx + 4) % TRAIL;
     }
     var back = 4 / (f.spd || 1);
-    pushI(f.x - f.vx * back, f.y - f.vy * back, 7, 7, 0, guv, 1, 1, 1, 0.55 * fa, 1, 0);
-    pushI(f.x, f.y, 12, 12, 0, guv, 1, 1, 1, 0.9 * fa, 1, 0);
+    pushI(f.x - f.vx * back, f.y - f.vy * back, 7, 7, 0, A.g_white, frgb[0], frgb[1], frgb[2], 0.55 * fa, 1, 0);
+    pushI(f.x, f.y, 12, 12, 0, A.g_white, frgb[0], frgb[1], frgb[2], 0.9 * fa, 1, 0);
     pushI(f.x, f.y, 2.5, 2.5, 0, A.white, 1, 1, 1, fa, 1, 0);
   }
 }
@@ -1811,13 +1887,13 @@ function drawGL(tSec) {
     var lbt = BOLTS[i];
     if (!lbt.active || lbt.delay > 0) continue;
     var bint = lbt.heavy ? 3.4 : 1.9;
-    addLight(lbt.x, lbt.y, minDim * (lbt.heavy ? 0.145 : 0.09), bint, FRGB[lbt.fac]);
+    addLight(lbt.x, lbt.y, minDim * (lbt.heavy ? 0.145 : 0.09), bint, BOLT_LIGHT_RGB);
     if (lbt.heavy) {
-      addLight(lbt.x - lbt.vx * 0.30, lbt.y - lbt.vy * 0.30, minDim * 0.115, bint * 0.55, FRGB[lbt.fac]);
-      addLight(lbt.x - lbt.vx * 0.62, lbt.y - lbt.vy * 0.62, minDim * 0.095, bint * 0.28, FRGB[lbt.fac]);
-      if (lbt.age < 0.3) addLight(lbt.sx, lbt.sy, minDim * 0.13, (1 - lbt.age / 0.3) * 2.8, FRGB[lbt.fac]);
+      addLight(lbt.x - lbt.vx * 0.30, lbt.y - lbt.vy * 0.30, minDim * 0.115, bint * 0.55, BOLT_LIGHT_RGB);
+      addLight(lbt.x - lbt.vx * 0.62, lbt.y - lbt.vy * 0.62, minDim * 0.095, bint * 0.28, BOLT_LIGHT_RGB);
+      if (lbt.age < 0.3) addLight(lbt.sx, lbt.sy, minDim * 0.13, (1 - lbt.age / 0.3) * 2.8, BOLT_LIGHT_RGB);
     } else if (lbt.age < 0.12) {
-      addLight(lbt.sx, lbt.sy, minDim * 0.09, (1 - lbt.age / 0.12) * 1.6, FRGB[lbt.fac]);
+      addLight(lbt.sx, lbt.sy, minDim * 0.09, (1 - lbt.age / 0.12) * 1.6, BOLT_LIGHT_RGB);
     }
   }
   for (i = 0; i < caps.length; i++) {
@@ -1940,19 +2016,18 @@ function drawGL(tSec) {
     var tl = b.heavy ? 0.26 : 0.16;
     var blen = Math.sqrt(b.vx * b.vx + b.vy * b.vy) * tl;
     var rot = Math.atan2(b.vy, b.vx);
-    var brgb = BOLT_RGB[b.fac];
     var bh = b.heavy ? 8 : 4.2;
-    pushI(b.x - b.vx * tl * 0.5, b.y - b.vy * tl * 0.5, blen, bh, rot, A.streak, brgb[0], brgb[1], brgb[2], 0.9, 1, 0);
+    pushI(b.x - b.vx * tl * 0.5, b.y - b.vy * tl * 0.5, blen, bh, rot, A.streak, BOLT_RGB[0], BOLT_RGB[1], BOLT_RGB[2], 0.9, 1, 0);
     pushI(b.x - b.vx * tl * 0.3, b.y - b.vy * tl * 0.3, blen * 0.55, bh * 0.36, rot, A.streak, 1, 1, 1, 0.95, 1, 0);
     var gs = b.heavy ? 13 : 8;
-    pushI(b.x, b.y, gs * 2, gs * 2, 0, A["g_" + b.fac], 1, 1, 1, 0.8, 1, 0);
+    pushI(b.x, b.y, gs * 2, gs * 2, 0, A.g_red, 1, 1, 1, 0.8, 1, 0);
     pushI(b.x, b.y, gs, gs, 0, A.g_white, 1, 1, 1, 1, 1, 0);
     if (b.heavy && b.age < 0.3) {   // recoil-style muzzle flare on main guns
       var mf = 1 - b.age / 0.3;
-      pushI(b.sx, b.sy, 48, 48, 0, A["g_" + b.fac], 1, 1, 1, mf * 0.9, 1, 0);
+      pushI(b.sx, b.sy, 48, 48, 0, A.g_red, 1, 1, 1, mf * 0.9, 1, 0);
       pushI(b.sx, b.sy, 20, 20, 0, A.g_white, 1, 1, 1, mf, 1, 0);
     } else if (!b.heavy && b.age < 0.12) {
-      pushI(b.sx, b.sy, 24, 24, 0, A["g_" + b.fac], 1, 1, 1, (1 - b.age / 0.12) * 0.8, 1, 0);
+      pushI(b.sx, b.sy, 24, 24, 0, A.g_red, 1, 1, 1, (1 - b.age / 0.12) * 0.8, 1, 0);
     }
   }
 
