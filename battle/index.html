@@ -284,7 +284,7 @@ for (var ti2 = 0; ti2 < 8; ti2++) {
   TWK.push({ fx: rng(), fy: rng() * 0.95, w: 0.6 + rng() * 1.4, ph: rng() * 6.283 });
 }
 var DIST = [];  // far depth layer: distant traffic, slow and low-contrast
-for (var zi = 0; zi < 7; zi++) {
+for (var zi = 0; zi < 10; zi++) {
   var dHue = rng() < 0.5 ? FAC.order.hue : FAC.entropy.hue;
   DIST.push({
     fx: rng(), fy: 0.05 + rng() * 0.85,
@@ -292,6 +292,30 @@ for (var zi = 0; zi < 7; zi++) {
     dvx: (rng() < 0.5 ? -1 : 1) * (0.0008 + rng() * 0.0016),
     col: "hsla(" + dHue + ",18%,62%,1)",
     rgb: hsl2rgb(dHue, 0.18, 0.62)
+  });
+}
+var FARF = [];  // a third fleet at extreme range holding the lower-left:
+                // tiny dim bars with a faint engine point — barely resolvable,
+                // bounded drift so the formation never wanders off station
+for (var ff = 0; ff < 6; ff++) {
+  var fHue = rng() < 0.5 ? FAC.order.hue : FAC.entropy.hue;
+  FARF.push({
+    fx: 0.06 + rng() * 0.22, fy: 0.68 + rng() * 0.24,
+    len: 6 + rng() * 8,
+    w: 6.283 / (160 + rng() * 140), ph: rng() * 6.283, ph2: rng() * 6.283,
+    gper: 9 + rng() * 11, gph: rng(),          // sparse far-off weapon glints
+    col: "hsla(" + fHue + ",14%,58%,1)",
+    rgb: hsl2rgb(fHue, 0.14, 0.58)
+  });
+}
+var DEBL = [];  // drifting debris field over the lower-left, one layer nearer
+                // than the global specks (bigger, brighter, bounded wander)
+for (var dl = 0; dl < 14; dl++) {
+  DEBL.push({
+    fx: 0.02 + rng() * 0.32, fy: 0.62 + rng() * 0.34,
+    s: 1.4 + rng() * 1.8,
+    w: 6.283 / (70 + rng() * 90), ph: rng() * 6.283,
+    w2: 6.283 / (90 + rng() * 110), ph2: rng() * 6.283
   });
 }
 
@@ -386,14 +410,17 @@ function buildStarfield() {
   g.fillRect(0, 0, W, H);
   // nebula wash: faction-tinted near each fleet, a brighter core behind the
   // engagement for contrast, neutral bands filling the whole frame
+  var ecx = (ANCH.order[0] + ANCH.entropy[0]) / 2;   // engagement midpoint:
+  var ecy = (ANCH.order[1] + ANCH.entropy[1]) / 2;   // the frame's focal point
   nebBlob(g, ANCH.order[0], ANCH.order[1] - H * 0.08, minDim * 0.6, FAC.order.hue, 0.08 * (0.5 + 0.5 * FAC.order.strength));
   nebBlob(g, ANCH.entropy[0], ANCH.entropy[1] - H * 0.05, minDim * 0.55, FAC.entropy.hue, 0.08 * (0.5 + 0.5 * FAC.entropy.strength));
-  nebBlob(g, W * 0.56, H * 0.42, minDim * 1.0, 228, 0.06);
-  nebBlob(g, W * 0.2, H * 0.78, minDim * 0.8, 225, 0.035);
+  nebBlob(g, ecx, ecy, minDim * 1.0, 228, 0.06);
+  // the lower-left corner is depth, not emptiness: a cool nebula shoulder
+  // sits behind the far fleet and debris field that drift there
+  nebBlob(g, W * 0.16, H * 0.82, minDim * 0.9, 225, 0.05);
   nebBlob(g, W * 0.82, H * 0.18, minDim * 0.7, 232, 0.04);
   // distant planet: a limb arc rising out of the lower-right corner —
-  // something the battle happens NEAR, never the subject of the frame. (The
-  // near hull owns the lower-left, so the planet keeps clear of it.)
+  // something the battle happens NEAR, never the subject of the frame.
   // Lit by the screen-top key (biased a little right so the terminator falls
   // inside the frame): bright limb upper-right, sinking to near-black toward
   // the lower-left, with low-contrast banding so it reads as a world.
@@ -519,7 +546,7 @@ function buildStarfield() {
   g.fillStyle = kg;
   g.fillRect(0, 0, W, H * 0.3);
   // cinematic vignette: pulls the eye to the engagement, deepens the corners
-  var vg = g.createRadialGradient(W * 0.56, H * 0.42, minDim * 0.45, W * 0.56, H * 0.42, Math.max(W, H) * 0.75);
+  var vg = g.createRadialGradient(ecx, ecy, minDim * 0.45, ecx, ecy, Math.max(W, H) * 0.75);
   vg.addColorStop(0, "rgba(0,0,0,0)");
   vg.addColorStop(1, "rgba(0,0,0,0.38)");
   g.fillStyle = vg;
@@ -813,164 +840,20 @@ function buildShipSprite(cap) {
   cap.sprite = cnv; cap.sw = cw; cap.sh = ch;
 }
 
-/* ---- near-field silhouette: ONE big hull passing close to camera, pitched
-        up across the frame and anchored at the lower-left so the corner crops
-        it — it reads as a warship passing, not moored. The top edge is
-        staggered (blocks, a tall tower, a hangar notch, a comms mast): never
-        one unbroken line. GL bakes a mid-dark material rendered at very low
-        ambient, so an explosion can flood it out of darkness; the 2D fallback
-        keeps the near-black bake. ---- */
-var NEAR = [];
-function buildNearSprites() {
-  NEAR.length = 0;
-  var nr = mulberry32(SEED ^ 0x517cc1b7);
-  var len = minDim * 0.92, hh = len * 0.15;
-  var cw = Math.ceil(len) + 6, ch = Math.ceil(hh * 3.2) + 6;
-  var cnv = document.createElement("canvas");
-  cnv.width = cw; cnv.height = ch;
-  var g = cnv.getContext("2d");
-  g.translate(3, ch / 2);
-  function nj(a) { return (nr() - 0.5) * a; }
-  // staggered silhouette, prow at +x: wedge bow, forward block, tall mid
-  // tower, hangar notch, aft stacks — varied height along the whole length
-  var top = [
-    [1, -0.10], [0.93 + nj(0.03), -0.46], [0.88, -0.46], [0.85, -(0.80 + nj(0.06))],
-    [0.78, -0.76], [0.76, -0.44], [0.67, -0.50], [0.64, -1.12], [0.57, -1.12],
-    [0.55, -0.55], [0.50, -0.60], [0.475, -0.30], [0.37, -(0.33 + nj(0.05))],
-    [0.34, -0.88], [0.27, -0.82], [0.25, -0.52], [0.13, -0.58], [0.09, -0.95],
-    [0.05, -0.92], [0, -0.55]
-  ];
-  var bot = [
-    [0, 0.6], [0.2 + nj(0.06), 0.78], [0.55, 0.72 + nj(0.08)],
-    [0.78, 0.42], [0.95, 0.3], [1, 0.08]
-  ];
-  var fill = g.createLinearGradient(0, -hh * 1.3, 0, hh);
-  if (GLR) {
-    fill.addColorStop(0, "hsl(218,14%,30%)");
-    fill.addColorStop(0.18, "hsl(220,15%,19%)");
-    fill.addColorStop(1, "hsl(222,16%,13%)");
-  } else {
-    fill.addColorStop(0, "hsl(218,14%,9%)");    // the key light grazing the top
-    fill.addColorStop(0.18, "hsl(220,15%,4%)");
-    fill.addColorStop(1, "hsl(222,16%,2%)");
-  }
-  g.fillStyle = fill;
-  g.beginPath();
-  g.moveTo(len * top[0][0], hh * top[0][1]);
-  for (var v = 1; v < top.length; v++) g.lineTo(len * top[v][0], hh * top[v][1]);
-  for (var v2 = 0; v2 < bot.length; v2++) g.lineTo(len * bot[v2][0], hh * bot[v2][1]);
-  g.closePath();
-  g.fill();
-  // comms mast with a cross spar off the mid tower (breaks the skyline further)
-  g.strokeStyle = "rgba(150,170,200,0.55)";
-  g.lineWidth = 1.5;
-  g.beginPath();
-  g.moveTo(len * 0.60, -hh * 1.10); g.lineTo(len * 0.60, -hh * 1.50);
-  g.moveTo(len * 0.575, -hh * 1.38); g.lineTo(len * 0.625, -hh * 1.38);
-  g.stroke();
-  // raised ribs where the light grazes the upper hull (relief in the normal map)
-  var ribs2 = [];
-  g.fillStyle = "rgba(170,190,215,0.045)";
-  for (var pp = 0; pp < 4; pp++) {
-    var rbx = len * (0.1 + nr() * 0.75), rby = -hh * (0.42 + nr() * 0.22);
-    var rbw = len * (0.03 + nr() * 0.06), rbh = Math.max(1.5, hh * 0.035);
-    g.fillRect(rbx, rby, rbw, rbh);
-    ribs2.push({ x: rbx, y: rby, w: rbw, h: rbh, side: -1 });
-  }
-  // recessed bays bite into the hull — the normal map carves them too
-  var bays2 = [];
-  g.fillStyle = "rgba(0,0,0,0.35)";
-  for (var qq = 0; qq < 4; qq++) {
-    var bqx = len * (0.15 + nr() * 0.7), bqy = hh * (0.05 + nr() * 0.4);
-    var bqw = len * (0.03 + nr() * 0.06), bqh = hh * 0.12;
-    g.fillRect(bqx, bqy, bqw, bqh);
-    bays2.push({ x: bqx, y: bqy, w: bqw, h: bqh });
-  }
-  if (GLR) {   // panel seams that only read when a light rakes the hull
-    g.strokeStyle = "rgba(0,0,0,0.38)";
-    g.lineWidth = 1;
-    for (var sm = len * 0.08; sm < len * 0.92; sm += 26 + nr() * 14) {
-      g.beginPath();
-      g.moveTo(sm, -hh * 0.6);
-      g.lineTo(sm + (nr() - 0.5) * 10, hh * 0.55);
-      g.stroke();
-    }
-  }
-  // real rim light along the key-lit edge: soft pass, then a hard pass
-  for (var rp = 0; rp < 2; rp++) {
-    g.strokeStyle = rp ? "rgba(215,232,252,0.55)" : "rgba(195,215,240,0.16)";
-    g.lineWidth = rp ? 1.2 : 3.5;
-    g.beginPath();
-    g.moveTo(len * top[0][0], hh * top[0][1]);
-    for (var rv = 1; rv < top.length; rv++) g.lineTo(len * top[rv][0], hh * top[rv][1]);
-    g.stroke();
-  }
-  // dim porthole rows — inhabited, not a cutout (emissive in the GL bake)
-  var ems = [];
-  g.fillStyle = GLR ? "rgba(205,218,240,0.5)" : "rgba(190,205,228,0.16)";
-  for (var p2 = 0; p2 < 14; p2++) {
-    var ppx = len * (0.08 + nr() * 0.84), ppy = (nr() - 0.3) * hh * 0.7;
-    g.fillRect(ppx, ppy, 1.6, 1.6);
-    ems.push({ x: ppx, y: ppy, w: 1.6, h: 1.6, e: 0.55 });
-  }
-  // faint warm engine slits at the stern
-  g.fillStyle = "hsla(" + (nr() < 0.5 ? FAC.order.hue : FAC.entropy.hue) + ",60%,60%,0.25)";
-  for (var eb = 0; eb < 3; eb++) {
-    g.fillRect(1, -hh * 0.3 + eb * hh * 0.28, 2.5, hh * 0.14);
-    ems.push({ x: 1, y: -hh * 0.3 + eb * hh * 0.28, w: 2.5, h: hh * 0.14, e: 0.45 });
-  }
-  // running lights blink live (sprite-centered coords): prow, mast top, aft stack
-  var lights = new Float32Array(9);
-  var lu = [1.0, 0.60, 0.09], lv = [-0.10, -1.50, -0.93];
-  for (var lt = 0; lt < 3; lt++) {
-    lights[lt * 3] = len * lu[lt] + 3 - cw / 2;
-    lights[lt * 3 + 1] = hh * lv[lt];
-    lights[lt * 3 + 2] = nr();
-  }
-  // normals swept from the silhouette's own generating polylines
-  var nrm = null;
-  if (GLR) {
-    var topP = [], botP = [], pv;
-    for (pv = top.length - 1; pv >= 0; pv--) topP.push([len * top[pv][0], hh * top[pv][1]]);
-    for (pv = 0; pv < bot.length; pv++) botP.push([len * bot[pv][0], hh * bot[pv][1]]);
-    var polyAt = function (P) {
-      return function (lx) {
-        if (lx <= P[0][0]) return P[0][1];
-        for (var k = 1; k < P.length; k++) {
-          if (lx <= P[k][0]) {
-            var a = P[k - 1], b = P[k];
-            return a[1] + (b[1] - a[1]) * ((lx - a[0]) / ((b[0] - a[0]) || 1));
-          }
-        }
-        return P[P.length - 1][1];
-      };
-    };
-    nrm = bakeNormals(cw, ch, 3, ch / 2, len, polyAt(topP), polyAt(botP),
-      { tiers: [], bells: [], ems: ems, prow: 0, bays: bays2, ribs: ribs2 });
-  }
-  // pitched bow-up so the top edge cuts a diagonal; prow always runs up-right
-  NEAR.push({
-    cnv: cnv, cw: cw, ch: ch, nrm: nrm,
-    w: 6.283 / 620, ph: nr() * 6.283, ph2: nr() * 6.283,
-    ang: -(0.26 + nr() * 0.10), yf: 0.88,
-    flip: 1,
-    lights: lights, lper: 1.8 + nr() * 1.6
-  });
-}
-
 function layoutCapitals() {
   var land = W >= H;
-  // composition: the near hull enters at the lower-left pitched up-right, so
-  // the fleets sit on that same diagonal — engagement focal point just above
-  // and right of centre, Order the nearer (secondary) mass
+  // composition: the two fleets sit on a lower-left -> upper-right diagonal
+  // that runs through the centre of the frame, so the engagement midpoint IS
+  // the focal point. Order holds the nearer, lower station; the dim far
+  // fleet and debris field carry the lower-left corner behind it.
   if (land) {
-    ANCH.order[0] = W * 0.42; ANCH.order[1] = H * 0.52;
-    ANCH.entropy[0] = W * 0.73; ANCH.entropy[1] = H * 0.30;
-    roam.x = W * 0.05; roam.y = H * 0.06; roam.w = W * 0.90; roam.h = H * 0.78;
+    ANCH.order[0] = W * 0.36; ANCH.order[1] = H * 0.60;
+    ANCH.entropy[0] = W * 0.68; ANCH.entropy[1] = H * 0.30;
+    roam.x = W * 0.05; roam.y = H * 0.06; roam.w = W * 0.90; roam.h = H * 0.80;
   } else {
-    ANCH.order[0] = W * 0.46; ANCH.order[1] = H * 0.50;
-    ANCH.entropy[0] = W * 0.62; ANCH.entropy[1] = H * 0.26;
-    roam.x = W * 0.08; roam.y = H * 0.06; roam.w = W * 0.84; roam.h = H * 0.72;
+    ANCH.order[0] = W * 0.42; ANCH.order[1] = H * 0.56;
+    ANCH.entropy[0] = W * 0.64; ANCH.entropy[1] = H * 0.27;
+    roam.x = W * 0.08; roam.y = H * 0.06; roam.w = W * 0.84; roam.h = H * 0.78;
   }
   var sides = ["order", "entropy"];
   for (var s = 0; s < 2; s++) {
@@ -986,8 +869,9 @@ function layoutCapitals() {
       cap.ax = ax + pxd * off + Math.cos(dir) * along;
       cap.ay = ay + pyd * off + Math.sin(dir) * along;
       cap.baseAng = dir + cap.angDev;
-      // larger fleet scale so the capitals hold their own against the near hull
-      cap.len = minDim * (0.14 + 0.19 * cap.size);
+      // the capitals carry the whole sense of scale: big enough that the
+      // fixed-pitch window rows resolve and fighters read as motes beside them
+      cap.len = minDim * (0.155 + 0.215 * cap.size);
       cap.x = cap.ax; cap.y = cap.ay; cap.ang = cap.baseAng;
       buildShipSprite(cap);
     }
@@ -1034,7 +918,6 @@ function resize() {
   REACH2 = Math.pow(minDim * 0.03 + 8, 2);
   layoutCapitals();
   buildStarfield();
-  buildNearSprites();
   if (GLR) glResize();
   for (var i = 0; i < ftrs.length; i++) {
     var f = ftrs[i];
@@ -1235,6 +1118,25 @@ function draw(tSec) {
   }
   ctx.globalAlpha = 1;
 
+  // far fleet in the lower-left: dim bars + engine point + rare weapon glints
+  for (i = 0; i < FARF.length; i++) {
+    var fs = FARF[i];
+    var fxp = fs.fx * W + Math.sin(tSec * fs.w + fs.ph) * minDim * 0.012;
+    var fyp = fs.fy * H + Math.sin(tSec * fs.w * 0.7 + fs.ph2) * minDim * 0.006;
+    ctx.globalAlpha = 0.42;
+    ctx.fillStyle = fs.col;
+    ctx.fillRect(fxp, fyp, fs.len, 1.2);
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = "#cfdcf0";
+    ctx.fillRect(fxp - 1.4, fyp, 1.2, 1.2);          // engine point at the stern
+    var gph = (tSec / fs.gper + fs.gph) % 1;
+    if (gph < 0.035) {                               // a far-off shot flickers
+      ctx.globalAlpha = 0.5 * (1 - gph / 0.035);
+      ctx.drawImage(GLOW.red, fxp + fs.len + 2 - 3, fyp - 2.4, 6, 6);
+    }
+  }
+  ctx.globalAlpha = 1;
+
   // debris: slow specks, position is periodic in time
   ctx.fillStyle = "#434b59";
   ctx.globalAlpha = 0.3;
@@ -1243,6 +1145,16 @@ function draw(tSec) {
     var dx2 = (((dd.fx + tSec * dd.dvx) % 1) + 1) % 1;
     var dy2 = (((dd.fy + tSec * dd.dvy) % 1) + 1) % 1;
     ctx.fillRect(dx2 * W, dy2 * H, dd.s, dd.s);
+  }
+  // lower-left debris field: a nearer layer, so bigger, brighter, slower sway
+  ctx.fillStyle = "#4c5567";
+  ctx.globalAlpha = 0.42;
+  for (i = 0; i < DEBL.length; i++) {
+    var dq = DEBL[i];
+    ctx.fillRect(
+      dq.fx * W + Math.sin(tSec * dq.w + dq.ph) * minDim * 0.02,
+      dq.fy * H + Math.sin(tSec * dq.w2 + dq.ph2) * minDim * 0.012,
+      dq.s, dq.s);
   }
   ctx.globalAlpha = 1;
 
@@ -1416,30 +1328,6 @@ function draw(tSec) {
 
   ctx.globalCompositeOperation = "source-over";
   ctx.globalAlpha = 1;
-
-  // near depth layer: dark silhouette anchored off the lower-left corner,
-  // drifting slowly — the corner crop + pitch read as a close pass
-  for (i = 0; i < NEAR.length; i++) {
-    var ns = NEAR[i];
-    var nx = W * 0.24 + Math.sin(tSec * ns.w + ns.ph) * W * 0.09;
-    var ny = H * ns.yf + Math.sin(tSec * ns.w * 0.6 + ns.ph2) * H * 0.030;
-    ctx.save();
-    ctx.translate(nx, ny);
-    ctx.rotate(ns.ang);
-    ctx.scale(ns.flip, 1);
-    ctx.drawImage(ns.cnv, -ns.cw / 2, -ns.ch / 2);
-    ctx.globalCompositeOperation = "lighter";
-    for (var nl = 0; nl < 3; nl++) {
-      var lph = (tSec / ns.lper + ns.lights[nl * 3 + 2]) % 1;
-      if (lph < 0.1) {
-        ctx.globalAlpha = 0.8;
-        ctx.drawImage(GLOW.white, ns.lights[nl * 3] - 3, ns.lights[nl * 3 + 1] - 3, 6, 6);
-      }
-    }
-    ctx.globalCompositeOperation = "source-over";
-    ctx.globalAlpha = 1;
-    ctx.restore();
-  }
 }
 
 /* =====================================================================
@@ -1453,8 +1341,7 @@ function draw(tSec) {
    side of the hull they grow from; engine bells get concave rings with
    a hot emissive core; the Order hammerhead's flat bow face gets
    forward-facing normals; lit windows recorded during the albedo bake
-   become an emissive mask in A. The near silhouette is swept the same
-   way from its own top/bottom generating polylines. Both bakes go into
+   become an emissive mask in A. Both bakes go into
    one atlas pair; the whole frame is ONE instanced draw with
    premultiplied blending (alpha-out 0 == additive). Up to 24 point
    lights come from the sim: explosions, bolts in flight (with a
@@ -1777,7 +1664,6 @@ function blitN(dst, dw, sx0, sy0, srcArr, sw2, sh2) {
 function glBuildAtlas() {
   var R = GLR, gl = R.gl, items = [], i;
   for (i = 0; i < caps.length; i++) items.push({ key: "cap" + i, cnv: caps[i].sprite, nrm: caps[i].nrm, w: caps[i].sw, h: caps[i].sh });
-  for (i = 0; i < NEAR.length; i++) items.push({ key: "near" + i, cnv: NEAR[i].cnv, nrm: NEAR[i].nrm, w: NEAR[i].cw, h: NEAR[i].ch });
   var gk = ["order", "entropy", "white", "warm", "red"];
   for (i = 0; i < gk.length; i++) items.push({ key: "g_" + gk[i], cnv: GLOW[gk[i]], nrm: null, w: 64, h: 64 });
   items.push({ key: "streak", cnv: STREAK, nrm: null, w: 128, h: 16 });
@@ -1912,11 +1798,30 @@ function drawGL(tSec) {
     var zx = ((((dz.fx + tSec * dz.dvx) % 1) + 1) % 1) * W;
     pushI(zx + dz.len / 2, dz.fy * H + 0.5, dz.len, 1, 0, A.white, dz.rgb[0], dz.rgb[1], dz.rgb[2], 0.3, 1, 0);
   }
+  // far fleet in the lower-left: dim bars + engine point + rare weapon glints
+  for (i = 0; i < FARF.length; i++) {
+    var fs = FARF[i];
+    var fxp = fs.fx * W + Math.sin(tSec * fs.w + fs.ph) * minDim * 0.012;
+    var fyp = fs.fy * H + Math.sin(tSec * fs.w * 0.7 + fs.ph2) * minDim * 0.006;
+    pushI(fxp + fs.len / 2, fyp + 0.6, fs.len, 1.2, 0, A.white, fs.rgb[0], fs.rgb[1], fs.rgb[2], 0.42, 1, 0);
+    pushI(fxp - 0.8, fyp + 0.6, 1.2, 1.2, 0, A.white, 0.81, 0.86, 0.94, 0.55, 1, 0);
+    var gph = (tSec / fs.gper + fs.gph) % 1;
+    if (gph < 0.035) {
+      pushI(fxp + fs.len + 2, fyp + 0.6, 6, 6, 0, A.g_red, 1, 1, 1, 0.5 * (1 - gph / 0.035), 1, 0);
+    }
+  }
   for (i = 0; i < DEB.length; i++) {
     var dd = DEB[i];
     var dx2 = (((dd.fx + tSec * dd.dvx) % 1) + 1) % 1;
     var dy2 = (((dd.fy + tSec * dd.dvy) % 1) + 1) % 1;
     pushI(dx2 * W, dy2 * H, dd.s, dd.s, 0, A.white, DEBRIS_RGB[0], DEBRIS_RGB[1], DEBRIS_RGB[2], 0.3, 1, 0);
+  }
+  // lower-left debris field: a nearer layer, so bigger, brighter, slower sway
+  for (i = 0; i < DEBL.length; i++) {
+    var dq = DEBL[i];
+    pushI(dq.fx * W + Math.sin(tSec * dq.w + dq.ph) * minDim * 0.02,
+      dq.fy * H + Math.sin(tSec * dq.w2 + dq.ph2) * minDim * 0.012,
+      dq.s, dq.s, 0, A.white, 0.30, 0.33, 0.40, 0.42, 1, 0);
   }
 
   pushFightersGL(false, tSec);
@@ -2037,24 +1942,6 @@ function drawGL(tSec) {
     var tw = TWK[i];
     pushI(tw.fx * W, tw.fy * H, 6, 6, 0, A.g_white, 1, 1, 1,
       0.12 + 0.2 * (0.5 + 0.5 * Math.sin(tSec * tw.w + tw.ph)), 1, 0);
-  }
-
-  // near silhouette: ambient 0.12 keeps it near-black until a bolt or
-  // explosion floods it — the hero reveal of the whole lighting pass
-  for (i = 0; i < NEAR.length; i++) {
-    var ns = NEAR[i];
-    var nx = W * 0.24 + Math.sin(tSec * ns.w + ns.ph) * W * 0.09;
-    var ny = H * ns.yf + Math.sin(tSec * ns.w * 0.6 + ns.ph2) * H * 0.030;
-    pushI(nx, ny, ns.cw * ns.flip, ns.ch, ns.ang, A["near" + i], 1, 1, 1, 1, 0, 0.12);
-    var nca = Math.cos(ns.ang), nsa = Math.sin(ns.ang);
-    for (var nl = 0; nl < 3; nl++) {
-      var lph = (tSec / ns.lper + ns.lights[nl * 3 + 2]) % 1;
-      if (lph < 0.1) {
-        var nlx = ns.lights[nl * 3] * ns.flip, nly = ns.lights[nl * 3 + 1];
-        pushI(nx + nca * nlx - nsa * nly, ny + nsa * nlx + nca * nly,
-          6, 6, 0, A.g_white, 1, 1, 1, 0.8, 1, 0);
-      }
-    }
   }
 
   /* ---- one instanced draw ---- */
