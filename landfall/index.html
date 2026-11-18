@@ -11,7 +11,6 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<script src="scene-params.js"></script>
 <script>
 /* ===========================================================================
  * LANDFALL — a data-driven colonization wallpaper for ROB64.
@@ -2654,7 +2653,39 @@ function makeC2D(canvas, atlasCanvas) {
  *  BOOT
  * ======================================================================== */
 
-(function main() {
+/* ------------------------------------------------------------ self-refresh
+ * Nothing outside this page can tell it to update: the generator runs on a
+ * different machine, and the wallpaper host gives no reload hook we can reach
+ * from there. So the page watches its own data file.
+ *
+ * Every `checkMin` minutes it re-loads `scene-params.js` under a fresh query
+ * string and compares the payload. Changed -> reload the document, which also
+ * picks up any new `colony.html`. Unchanged -> nothing happens; the cost is
+ * one small file read an hour.
+ *
+ * A daily reload runs regardless, so a code-only change still lands in a week
+ * where the numbers happen not to move. */
+function loadParams(done) {
+  const s = document.createElement('script');
+  s.src = 'scene-params.js?cb=' + Date.now();
+  s.onload = () => { s.remove(); done(true); };
+  s.onerror = () => { s.remove(); done(false); };   // missing file -> built-in sample
+  document.head.appendChild(s);
+}
+
+function watchForUpdates(checkMin) {
+  const bootedAt = Date.now();
+  const snapshot = () => { try { return JSON.stringify(window.SCENE_PARAMS); } catch (e) { return ''; } };
+  let last = snapshot();
+  setInterval(() => {
+    if (Date.now() - bootedAt > 24 * 3600 * 1000) { location.reload(); return; }
+    loadParams(() => {
+      if (snapshot() !== last) location.reload();
+    });
+  }, Math.max(0.05, checkMin) * 60 * 1000);   // floor is for `?check=`, a debug aid
+}
+
+function main() {
   const canvas = document.getElementById('c');
   const q = new URLSearchParams(location.search);
   const qNum = (k, lo, hi) => {
@@ -2757,6 +2788,9 @@ function makeC2D(canvas, atlasCanvas) {
   window.LANDFALL_RESET_PERF = () => { perfSum = 0; perfN = 0; perfMax = 0; };
   requestAnimationFrame(tick);
 
+  // Watch for a new week. `?check=` overrides the interval, in minutes.
+  watchForUpdates(qNum('check', 0.01, 1440) || 60);
+
   // A tiny handle for the capture harness and for debugging; nothing reads it
   // in normal operation.
   window.LANDFALL = {
@@ -2771,7 +2805,13 @@ function makeC2D(canvas, atlasCanvas) {
                        instances: perfInst, additive: perfAdd } };
     }
   };
-})();
+}
+
+// The data file loads here rather than from a static tag, so that every read —
+// boot and refresh alike — goes through the same cache-busted path. A missing
+// or broken file is not fatal: main() falls back to the built-in sample, which
+// is why the page can never show a blank screen.
+loadParams(() => main());
 </script>
 </body>
 </html>
