@@ -28,6 +28,7 @@
 var SAMPLE = {
   generated: "2026-11-15T20:40:00-05:00",
   window: { start: "2026-11-09", end: "2026-11-15" },
+  temper: 0.35,
   factions: {
     order:   { name: "Order",   hue: 200, strength: 0.72 },
     entropy: { name: "Entropy", hue: 18,  strength: 0.41 }
@@ -67,7 +68,7 @@ var SAMPLE = {
     { t: 0.92, faction: "order",   kind: "launch", magnitude: 0.6 }
   ],
   metrics: {
-    commits: 23, tasksClosed: 14, tasksOpen: 9,
+    commits: 23, fleetAVolume: 14, fleetBVolume: 9,
     minutesLogged: 420, calendarDensity: 0.55, uptimePct: 0.98
   }
 };
@@ -104,6 +105,23 @@ var RAW = (window.ROB64_DATA && typeof window.ROB64_DATA === "object") ? window.
 var SEED = strSeed(RAW.generated);
 var rng = mulberry32(SEED);
 
+/* ---- temper: the week's CHARACTER, -1 .. +1. Both poles are positive.
+   +1 (yang) — ambition, expansion: more launches, fighters range wide,
+       formations spread and press outward, fire skews to quick fighter cannon.
+   -1 (yin) — resolution, consolidation: long sorties that end in a visible
+       return-and-dock, formations close ranks around the capitals, fire skews
+       to few heavy deliberate capital shells.
+   Missing / null / out-of-range all collapse to 0 = today's balanced scene.
+   Debug override: ?temper=<-1..1> forces the value regardless of data.js,
+   so both poles can be screenshotted without editing the data file. */
+var TEMPER = num(RAW.temper, 0, -1, 1);
+try {
+  var qTemp = parseFloat(new URLSearchParams(window.location.search).get("temper"));
+  if (isFinite(qTemp)) TEMPER = clamp(qTemp, -1, 1);
+} catch (eTemp) { /* ignore */ }
+var TY = Math.max(0, TEMPER);    // yang amount, 0..1
+var TN = Math.max(0, -TEMPER);   // yin amount, 0..1
+
 function mkFaction(key, defHue) {
   var src = (RAW.factions && RAW.factions[key]) || {};
   return {
@@ -120,15 +138,35 @@ var mCommits = num(MET.commits, 12, 0, 2000);
 var mMinutes = num(MET.minutesLogged, 300, 0, 100000);
 var mCal     = num(MET.calendarDensity, 0.5, 0, 1);
 var mUp      = num(MET.uptimePct, 1, 0, 1);
-var mClosed  = num(MET.tasksClosed, 10, 0, 10000);
-var mOpen    = num(MET.tasksOpen, 10, 0, 10000);
+// Per-fleet item volume. Legacy data.js files carried these as
+// tasksClosed/tasksOpen, which never held task counts — still read as a
+// fallback so an old generated file keeps rendering instead of dropping to the
+// default.
+var mVolA    = num(MET.fleetAVolume, num(MET.tasksClosed, 10, 0, 10000), 0, 10000);
+var mVolB    = num(MET.fleetBVolume, num(MET.tasksOpen, 10, 0, 10000), 0, 10000);
 
 var DEBRIS_N   = Math.round(clamp(mCommits, 6, 40));          // commits -> debris count
 var ENG_BOOST  = 0.6 + 0.6 * clamp(mMinutes / 600, 0, 1);     // minutesLogged -> engine glow
 var BUSY       = 0.6 + 0.8 * mCal;                            // calendarDensity -> fighter busyness
 var STAR_BRIGHT= 0.7 + 0.3 * mUp;                             // uptimePct -> star brightness
-var LIT_BONUS  = { order: 0.2 * clamp(mClosed / 50, 0, 1),    // tasksClosed -> Order lit windows
-                   entropy: 0.2 * clamp(mOpen / 50, 0, 1) };  // tasksOpen -> Entropy lit windows
+var LIT_BONUS  = { order: 0.2 * clamp(mVolA / 50, 0, 1),     // fleetAVolume -> order lit windows
+                   entropy: 0.2 * clamp(mVolB / 50, 0, 1) }; // fleetBVolume -> entropy lit windows
+
+/* temper-derived tunables; every one is 1 / neutral at TEMPER = 0 */
+var DRIFT    = 1 + 0.20 * TY - 0.22 * TN;   // ambient + capital drift tempo
+var FSPD_MUL = 1 + 0.15 * TY - 0.18 * TN;   // fighter cruise speed
+var SORTIE   = 1 - 0.30 * TY + 0.80 * TN;   // sortie length (yin: long, few launches)
+var HOMEBIAS = clamp(0.35 - 0.20 * TY + 0.25 * TN, 0, 1); // roam pull toward own anchor
+var STRIKE_P = 1 + 0.45 * TY - 0.45 * TN;   // fighter intercept-run propensity
+var FCD_MUL  = 1 - 0.45 * TY + 0.55 * TN;   // fighter cannon cooldown
+var SHELLS   = 1 + 0.40 * TY - 0.35 * TN;   // shells per capital volley
+var HEAVY_SC = 1 + 0.50 * TN - 0.12 * TY;   // heavy-shell visual weight / flare
+var SPACING  = 1 + 0.09 * TY - 0.40 * TN;   // lateral spacing inside a fleet
+                                            // (yang gain kept small: a 4-ship line
+                                            // already reaches the frame edge)
+var SEP      = 1 + 0.03 * TY - 0.12 * TN;   // fleet stand-off from the midpoint
+var REACHOUT = 1 + 0.50 * TY;               // strike waypoint envelope around a target
+var DOCK_T   = 14 * TN;                     // yin: seconds before expiry a craft heads home
 
 /* ---- capitals: cap at 4 per side, synthesize one if a side is empty ---- */
 var caps = [];
@@ -176,8 +214,8 @@ function mkFighter(fk, speed, agg, life) {
   return {
     fac: fk, spd01: speed, agg: agg, life: life,
     spd: 40, x: 0, y: 0, vx: 0, vy: 0, wx: 0, wy: 0,
-    mode: 0, tgt: -1, cd: 2 + rng() * 4,
-    timer: 20 + rng() * 60 + life * 120, fadeIn: 1,
+    mode: 0, tgt: -1, cd: 2 + rng() * 4, hold: 0,
+    timer: (20 + rng() * 60 + life * 120) * SORTIE, fadeIn: 1,
     front: rng() < 0.6,
     trail: new Float32Array(TRAIL * 2), ti: 0
   };
@@ -241,10 +279,13 @@ var GLOW = {
   warm: makeGlow(16, 92),           // explosions: hot red-orange beside red weapons fire
   red: makeGlow(5, 95)              // all weapons fire, both factions
 };
-// fighters read as hot near-white points with only a suggestion of faction hue
+// fighters carry enough faction chroma to tell the fleets apart at a glance,
+// but warm faction hues lift toward gold so a saturated fighter never reads
+// as the red weapons fire (bolts sit at hue 5)
+function ftrHue(h) { return (h < 45 || h > 330) ? 48 : h; }
 var FGLOW = {
-  order: makeGlow(FAC.order.hue, 22),
-  entropy: makeGlow(FAC.entropy.hue, 22)
+  order: makeGlow(ftrHue(FAC.order.hue), 55),
+  entropy: makeGlow(ftrHue(FAC.entropy.hue), 55)
 };
 var COL = {};
 (function () {
@@ -252,7 +293,7 @@ var COL = {};
   for (var s = 0; s < 2; s++) {
     var h = FAC[sides[s]].hue;
     COL[sides[s]] = {
-      trail: "hsla(" + h + ",20%,82%,1)",
+      trail: "hsla(" + ftrHue(h) + ",60%,76%,1)",
       shimmer: "hsla(" + h + ",80%,78%,1)"
     };
   }
@@ -261,7 +302,7 @@ var BOLT_COL = "hsl(5,95%,58%)";    // red body under the white-hot core
 var EMBER_COL = "hsl(22,90%,55%)";
 /* linear-ish RGB triples for the WebGL lit path */
 var FRGB = { order: hsl2rgb(FAC.order.hue, 0.9, 0.65), entropy: hsl2rgb(FAC.entropy.hue, 0.9, 0.65) };
-var FTR_RGB = { order: hsl2rgb(FAC.order.hue, 0.25, 0.82), entropy: hsl2rgb(FAC.entropy.hue, 0.25, 0.82) };
+var FTR_RGB = { order: hsl2rgb(ftrHue(FAC.order.hue), 0.75, 0.68), entropy: hsl2rgb(ftrHue(FAC.entropy.hue), 0.75, 0.68) };
 var BOLT_RGB = hsl2rgb(5, 0.95, 0.58);
 var BOLT_LIGHT_RGB = hsl2rgb(5, 0.9, 0.55);
 var SHIM_RGB = { order: hsl2rgb(FAC.order.hue, 0.8, 0.78), entropy: hsl2rgb(FAC.entropy.hue, 0.8, 0.78) };
@@ -340,8 +381,10 @@ for (var ski = 0; ski < 36; ski++) {
 function spawnBolt(sx, sy, tx, ty, fk, tcap, delay, heavy) {
   var b = BOLTS[boltIdx]; boltIdx = (boltIdx + 1) % BOLTS.length;
   var dx = tx - sx, dy = ty - sy, d = Math.sqrt(dx * dx + dy * dy) || 1;
-  var sp = minDim * (heavy ? 0.20 : 0.38);   // slow enough that a bolt's moving
-                                             // highlight visibly rakes along a hull
+  var sp = minDim * (heavy ? 0.20 * (1 + 0.10 * TY - 0.18 * TN) : 0.38);
+                                             // slow enough that a bolt's moving
+                                             // highlight visibly rakes along a hull;
+                                             // yin makes the big shells more deliberate
   b.active = true; b.delay = delay || 0; b.age = 0; b.ttl = d / sp;
   b.x = sx; b.y = sy; b.sx = sx; b.sy = sy;
   b.vx = dx / d * sp; b.vy = dy / d * sp;
@@ -855,6 +898,14 @@ function layoutCapitals() {
     ANCH.entropy[0] = W * 0.64; ANCH.entropy[1] = H * 0.27;
     roam.x = W * 0.08; roam.y = H * 0.06; roam.w = W * 0.84; roam.h = H * 0.78;
   }
+  // temper: yang pushes the fleets further out from the midpoint, yin draws
+  // them in; neither side moves alone, so no one reads as retreating
+  var mX = (ANCH.order[0] + ANCH.entropy[0]) / 2;
+  var mY = (ANCH.order[1] + ANCH.entropy[1]) / 2;
+  ANCH.order[0] = mX + (ANCH.order[0] - mX) * SEP;
+  ANCH.order[1] = mY + (ANCH.order[1] - mY) * SEP;
+  ANCH.entropy[0] = mX + (ANCH.entropy[0] - mX) * SEP;
+  ANCH.entropy[1] = mY + (ANCH.entropy[1] - mY) * SEP;
   var sides = ["order", "entropy"];
   for (var s = 0; s < 2; s++) {
     var fk = sides[s], other = sides[1 - s];
@@ -864,7 +915,7 @@ function layoutCapitals() {
     var idxs = CAPF[fk];
     for (var i = 0; i < idxs.length; i++) {
       var cap = caps[idxs[i]];
-      var off = (i - (idxs.length - 1) / 2) * 0.19 * minDim + cap.jPerp * minDim;
+      var off = (i - (idxs.length - 1) / 2) * 0.19 * SPACING * minDim + cap.jPerp * minDim;
       var along = cap.jAlong * minDim;
       cap.ax = ax + pxd * off + Math.cos(dir) * along;
       cap.ay = ay + pyd * off + Math.sin(dir) * along;
@@ -880,16 +931,16 @@ function layoutCapitals() {
 
 function pickRoam(f) {
   var px = roam.x + rng() * roam.w, py = roam.y + rng() * roam.h;
-  f.wx = px * 0.65 + ANCH[f.fac][0] * 0.35;
-  f.wy = py * 0.65 + ANCH[f.fac][1] * 0.35;
+  f.wx = px * (1 - HOMEBIAS) + ANCH[f.fac][0] * HOMEBIAS;
+  f.wy = py * (1 - HOMEBIAS) + ANCH[f.fac][1] * HOMEBIAS;
   f.mode = 0; f.tgt = -1;
 }
 function pickWaypoint(f) {
-  if (rng() < clamp(0.18 + 0.45 * f.agg * BUSY, 0, 0.8)) {
+  if (rng() < clamp((0.18 + 0.45 * f.agg * BUSY) * STRIKE_P, 0, 0.85)) {
     var enemy = f.fac === "order" ? "entropy" : "order";
     var tIdx = randCapIdx(enemy), c = caps[tIdx];
-    f.wx = c.x + (rng() - 0.5) * c.len * 2.2;
-    f.wy = c.y + (rng() - 0.5) * c.len * 1.2;
+    f.wx = c.x + (rng() - 0.5) * c.len * 2.2 * REACHOUT;
+    f.wy = c.y + (rng() - 0.5) * c.len * 1.2 * REACHOUT;
     f.mode = 1; f.tgt = tIdx;
   } else {
     pickRoam(f);
@@ -901,7 +952,10 @@ function respawnFighter(f, cap) {
   f.vx = Math.cos(cap.ang) * f.spd * 0.5;
   f.vy = Math.sin(cap.ang) * f.spd * 0.5;
   f.fadeIn = 0;
-  f.timer = 30 + f.life * 150;
+  f.timer = (30 + f.life * 150) * SORTIE;
+  // a small deck flash in the carrier's hue makes each launch legible;
+  // yang widens it so the carriers visibly put craft out more often
+  if (INITED) spawnBoom(cap.x, cap.y, minDim * (0.005 + 0.005 * TY), 0.6, f.fac);
   for (var k = 0; k < TRAIL; k++) { f.trail[k * 2] = f.x; f.trail[k * 2 + 1] = f.y; }
   pickWaypoint(f);
 }
@@ -921,7 +975,7 @@ function resize() {
   if (GLR) glResize();
   for (var i = 0; i < ftrs.length; i++) {
     var f = ftrs[i];
-    f.spd = minDim * (0.06 + 0.11 * f.spd01);
+    f.spd = minDim * (0.06 + 0.11 * f.spd01) * FSPD_MUL;
     if (!INITED) {
       var c = caps[randCapIdx(f.fac)];
       f.x = c.x + (rng() - 0.5) * minDim * 0.2;
@@ -941,7 +995,7 @@ function fireEvent(e) {
     // parallel-but-offset paths so they never read as a dashed line
     var src = caps[randCapIdx(e.fac)];
     var tIdx = randCapIdx(enemy), tgt = caps[tIdx];
-    var n = 1 + Math.round(e.mag * 2);
+    var n = 1 + Math.round(e.mag * 2 * SHELLS);
     var bdx = tgt.x - src.x, bdy = tgt.y - src.y;
     var bd = Math.sqrt(bdx * bdx + bdy * bdy) || 1;
     var pxn = -bdy / bd, pyn = bdx / bd;
@@ -952,7 +1006,7 @@ function fireEvent(e) {
         src.y + Math.sin(src.ang) * src.len * 0.45 + pyn * off,
         tgt.x + pxn * off * 0.6 + (rng() - 0.5) * tgt.len * 0.3,
         tgt.y + pyn * off * 0.6 + (rng() - 0.5) * tgt.len * 0.15,
-        e.fac, tIdx, i * (0.55 + rng() * 0.35), true);
+        e.fac, tIdx, i * (0.55 + rng() * 0.35) * (1 + 0.5 * TN), true);
     }
   } else if (e.kind === "loss") {
     var cIdx = randCapIdx(e.fac), c = caps[cIdx];
@@ -964,7 +1018,7 @@ function fireEvent(e) {
   } else { // launch
     var lIdx = randCapIdx(e.fac), lc = caps[lIdx];
     spawnBoom(lc.x, lc.y, minDim * 0.012, 1.0, e.fac);   // launch flash keeps faction hue (it's the carrier, not a shot)
-    var want = 1 + Math.round(e.mag * 3), got = 0;
+    var want = 1 + Math.round(e.mag * (3 + 2 * TY - 1.5 * TN)), got = 0;
     for (var k = 0; k < ftrs.length && got < want; k++) {
       if (ftrs[k].fac === e.fac) { respawnFighter(ftrs[k], lc); got++; }
     }
@@ -988,24 +1042,41 @@ function update(dt, tSec) {
       minDim * (0.008 + rng() * 0.02), 2 + rng() * 3, "white");
   }
 
-  // capitals: bounded periodic drift + slow yaw (safe for weeks of uptime)
-  var ampA = minDim * 0.012, i, cap;
+  // capitals: bounded periodic drift + slow yaw (safe for weeks of uptime);
+  // temper scales the drift tempo and sway, never the yaw (RCS draws key off it)
+  var ampA = minDim * 0.012 * (0.8 + 0.2 * DRIFT), dTT = tSec * DRIFT, i, cap;
   for (i = 0; i < caps.length; i++) {
     cap = caps[i];
-    cap.x = cap.ax + Math.sin(tSec * cap.wA + cap.dphA) * ampA;
-    cap.y = cap.ay + Math.sin(tSec * cap.wB + cap.dphB) * ampA * 0.8;
+    cap.x = cap.ax + Math.sin(dTT * cap.wA + cap.dphA) * ampA;
+    cap.y = cap.ay + Math.sin(dTT * cap.wB + cap.dphB) * ampA * 0.8;
     cap.ang = cap.baseAng + Math.sin(tSec * cap.wY + cap.dphY) * cap.yawAmp;
   }
 
   // fighters
   for (i = 0; i < ftrs.length; i++) {
     var f = ftrs[i];
+    if (f.hold > 0) {           // docked inside a hull (yin): sit out, relaunch later
+      f.hold -= dt;
+      if (f.hold <= 0) respawnFighter(f, caps[randCapIdx(f.fac)]);
+      continue;
+    }
     f.timer -= dt;
     if (f.timer <= 0) respawnFighter(f, caps[randCapIdx(f.fac)]);
     if (f.fadeIn < 1) f.fadeIn = Math.min(1, f.fadeIn + dt * 0.7);
+    // yin: near the end of a sortie, break off and run home to dock
+    if (TN > 0 && f.mode !== 2 && f.timer < DOCK_T) { f.mode = 2; f.tgt = randCapIdx(f.fac); }
+    if (f.mode === 2 && f.tgt >= 0) {
+      var hc = caps[f.tgt];
+      f.wx = hc.x; f.wy = hc.y;    // track the moving carrier
+      var hdx = hc.x - f.x, hdy = hc.y - f.y;
+      if (hdx * hdx + hdy * hdy < REACH2 * 2.5) {
+        f.hold = 4 + 10 * TN;      // visibly docks; the bay holds it a while
+        continue;
+      }
+    }
     var dx = f.wx - f.x, dy = f.wy - f.y;
     var d2 = dx * dx + dy * dy;
-    if (d2 < REACH2) {
+    if (d2 < REACH2 && f.mode !== 2) {
       pickWaypoint(f);
       dx = f.wx - f.x; dy = f.wy - f.y; d2 = dx * dx + dy * dy;
     }
@@ -1026,7 +1097,7 @@ function update(dt, tSec) {
       if (ex * ex + ey * ey < FIRE_R2) {
         f.cd -= dt * BUSY;
         if (f.cd <= 0) {
-          f.cd = 2.6 + (1 - f.agg) * 5;
+          f.cd = (2.6 + (1 - f.agg) * 5) * FCD_MUL;
           spawnBolt(f.x, f.y,
             c2.x + (rng() - 0.5) * c2.len * 0.4,
             c2.y + (rng() - 0.5) * c2.len * 0.2,
@@ -1046,7 +1117,7 @@ function update(dt, tSec) {
     b.y += b.vy * dt;
     if (b.age >= b.ttl) {
       b.active = false;
-      spawnBoom(b.x, b.y, minDim * (b.heavy ? 0.030 : 0.012), b.heavy ? 1.6 : 0.8, "red");
+      spawnBoom(b.x, b.y, minDim * (b.heavy ? 0.030 * HEAVY_SC : 0.012), b.heavy ? 1.6 : 0.8, "red");
       spawnSparks(b.x, b.y, b.heavy ? 8 : 4);
       if (b.tcap >= 0) spawnShim(b.tcap, 0.35 + rng() * 0.15, b.x, b.y);
     }
@@ -1072,7 +1143,7 @@ function update(dt, tSec) {
 function drawFighters(front, tSec) {
   for (var i = 0; i < ftrs.length; i++) {
     var f = ftrs[i];
-    if (f.front !== front) continue;
+    if (f.front !== front || f.hold > 0) continue;
     var fa = Math.min(1, f.fadeIn) * Math.min(1, f.timer * 0.5);
     if (fa <= 0.02) continue;
     // tapered additive trail, oldest -> newest, in 6 width/alpha chunks
@@ -1106,13 +1177,13 @@ function drawFighters(front, tSec) {
 
 function draw(tSec) {
   ctx.drawImage(starCnv, 0, 0, W, H);
-  var i;
+  var i, dT = tSec * DRIFT;   // ambient layers breathe at the temper's tempo
 
   // far depth layer: distant traffic, slow and low-contrast
   ctx.globalAlpha = 0.3;
   for (i = 0; i < DIST.length; i++) {
     var dz = DIST[i];
-    var zx = ((((dz.fx + tSec * dz.dvx) % 1) + 1) % 1) * W;
+    var zx = ((((dz.fx + dT * dz.dvx) % 1) + 1) % 1) * W;
     ctx.fillStyle = dz.col;
     ctx.fillRect(zx, dz.fy * H, dz.len, 1);
   }
@@ -1121,8 +1192,8 @@ function draw(tSec) {
   // far fleet in the lower-left: dim bars + engine point + rare weapon glints
   for (i = 0; i < FARF.length; i++) {
     var fs = FARF[i];
-    var fxp = fs.fx * W + Math.sin(tSec * fs.w + fs.ph) * minDim * 0.012;
-    var fyp = fs.fy * H + Math.sin(tSec * fs.w * 0.7 + fs.ph2) * minDim * 0.006;
+    var fxp = fs.fx * W + Math.sin(dT * fs.w + fs.ph) * minDim * 0.012;
+    var fyp = fs.fy * H + Math.sin(dT * fs.w * 0.7 + fs.ph2) * minDim * 0.006;
     ctx.globalAlpha = 0.42;
     ctx.fillStyle = fs.col;
     ctx.fillRect(fxp, fyp, fs.len, 1.2);
@@ -1142,8 +1213,8 @@ function draw(tSec) {
   ctx.globalAlpha = 0.3;
   for (i = 0; i < DEB.length; i++) {
     var dd = DEB[i];
-    var dx2 = (((dd.fx + tSec * dd.dvx) % 1) + 1) % 1;
-    var dy2 = (((dd.fy + tSec * dd.dvy) % 1) + 1) % 1;
+    var dx2 = (((dd.fx + dT * dd.dvx) % 1) + 1) % 1;
+    var dy2 = (((dd.fy + dT * dd.dvy) % 1) + 1) % 1;
     ctx.fillRect(dx2 * W, dy2 * H, dd.s, dd.s);
   }
   // lower-left debris field: a nearer layer, so bigger, brighter, slower sway
@@ -1152,8 +1223,8 @@ function draw(tSec) {
   for (i = 0; i < DEBL.length; i++) {
     var dq = DEBL[i];
     ctx.fillRect(
-      dq.fx * W + Math.sin(tSec * dq.w + dq.ph) * minDim * 0.02,
-      dq.fy * H + Math.sin(tSec * dq.w2 + dq.ph2) * minDim * 0.012,
+      dq.fx * W + Math.sin(dT * dq.w + dq.ph) * minDim * 0.02,
+      dq.fy * H + Math.sin(dT * dq.w2 + dq.ph2) * minDim * 0.012,
       dq.s, dq.s);
   }
   ctx.globalAlpha = 1;
@@ -1283,7 +1354,7 @@ function draw(tSec) {
   for (i = 0; i < BOLTS.length; i++) {
     var b = BOLTS[i];
     if (!b.active || b.delay > 0) continue;
-    var bw = b.heavy ? 4.2 : 2.2;
+    var bw = b.heavy ? 4.2 * HEAVY_SC : 2.2;
     var tl = b.heavy ? 0.26 : 0.16;
     ctx.globalAlpha = 0.85;
     ctx.strokeStyle = BOLT_COL;
@@ -1299,17 +1370,17 @@ function draw(tSec) {
     ctx.moveTo(b.x - b.vx * tl * 0.6, b.y - b.vy * tl * 0.6);
     ctx.lineTo(b.x, b.y);
     ctx.stroke();
-    var gs = b.heavy ? 13 : 8;
+    var gs = b.heavy ? 13 * HEAVY_SC : 8;
     ctx.globalAlpha = 0.8;
     ctx.drawImage(GLOW.red, b.x - gs, b.y - gs, gs * 2, gs * 2);
     ctx.globalAlpha = 1;
     ctx.drawImage(GLOW.white, b.x - gs * 0.5, b.y - gs * 0.5, gs, gs);
     if (b.heavy && b.age < 0.3) {   // recoil-style muzzle flare on main guns
-      var mf = 1 - b.age / 0.3;
+      var mf = 1 - b.age / 0.3, mz = 24 * HEAVY_SC, mw = 10 * HEAVY_SC;
       ctx.globalAlpha = mf * 0.9;
-      ctx.drawImage(GLOW.red, b.sx - 24, b.sy - 24, 48, 48);
+      ctx.drawImage(GLOW.red, b.sx - mz, b.sy - mz, mz * 2, mz * 2);
       ctx.globalAlpha = mf;
-      ctx.drawImage(GLOW.white, b.sx - 10, b.sy - 10, 20, 20);
+      ctx.drawImage(GLOW.white, b.sx - mw, b.sy - mw, mw * 2, mw * 2);
     } else if (!b.heavy && b.age < 0.12) {
       ctx.globalAlpha = (1 - b.age / 0.12) * 0.8;
       ctx.drawImage(GLOW.red, b.sx - 12, b.sy - 12, 24, 24);
@@ -1733,7 +1804,7 @@ function pushFightersGL(front, tSec) {
   var A = GLR.atlas;
   for (var i = 0; i < ftrs.length; i++) {
     var f = ftrs[i];
-    if (f.front !== front) continue;
+    if (f.front !== front || f.hold > 0) continue;
     var fa = Math.min(1, f.fadeIn) * Math.min(1, f.timer * 0.5);
     if (fa <= 0.02) continue;
     // near-white glow with a faint faction tint (white glow sprite × tint)
@@ -1754,6 +1825,7 @@ function pushFightersGL(front, tSec) {
 
 function drawGL(tSec) {
   var R = GLR, gl = R.gl, A = R.atlas, i;
+  var dT = tSec * DRIFT;   // ambient layers breathe at the temper's tempo
   R.count = 0; R.nl = 0;
 
   /* ---- dynamic lights from the sim: explosions > bolts/muzzles > engines ---- */
@@ -1772,7 +1844,7 @@ function drawGL(tSec) {
   for (i = 0; i < BOLTS.length; i++) {
     var lbt = BOLTS[i];
     if (!lbt.active || lbt.delay > 0) continue;
-    var bint = lbt.heavy ? 3.4 : 1.9;
+    var bint = lbt.heavy ? 3.4 * HEAVY_SC : 1.9;
     addLight(lbt.x, lbt.y, minDim * (lbt.heavy ? 0.145 : 0.09), bint, BOLT_LIGHT_RGB);
     if (lbt.heavy) {
       addLight(lbt.x - lbt.vx * 0.30, lbt.y - lbt.vy * 0.30, minDim * 0.115, bint * 0.55, BOLT_LIGHT_RGB);
@@ -1795,14 +1867,14 @@ function drawGL(tSec) {
 
   for (i = 0; i < DIST.length; i++) {
     var dz = DIST[i];
-    var zx = ((((dz.fx + tSec * dz.dvx) % 1) + 1) % 1) * W;
+    var zx = ((((dz.fx + dT * dz.dvx) % 1) + 1) % 1) * W;
     pushI(zx + dz.len / 2, dz.fy * H + 0.5, dz.len, 1, 0, A.white, dz.rgb[0], dz.rgb[1], dz.rgb[2], 0.3, 1, 0);
   }
   // far fleet in the lower-left: dim bars + engine point + rare weapon glints
   for (i = 0; i < FARF.length; i++) {
     var fs = FARF[i];
-    var fxp = fs.fx * W + Math.sin(tSec * fs.w + fs.ph) * minDim * 0.012;
-    var fyp = fs.fy * H + Math.sin(tSec * fs.w * 0.7 + fs.ph2) * minDim * 0.006;
+    var fxp = fs.fx * W + Math.sin(dT * fs.w + fs.ph) * minDim * 0.012;
+    var fyp = fs.fy * H + Math.sin(dT * fs.w * 0.7 + fs.ph2) * minDim * 0.006;
     pushI(fxp + fs.len / 2, fyp + 0.6, fs.len, 1.2, 0, A.white, fs.rgb[0], fs.rgb[1], fs.rgb[2], 0.42, 1, 0);
     pushI(fxp - 0.8, fyp + 0.6, 1.2, 1.2, 0, A.white, 0.81, 0.86, 0.94, 0.55, 1, 0);
     var gph = (tSec / fs.gper + fs.gph) % 1;
@@ -1812,15 +1884,15 @@ function drawGL(tSec) {
   }
   for (i = 0; i < DEB.length; i++) {
     var dd = DEB[i];
-    var dx2 = (((dd.fx + tSec * dd.dvx) % 1) + 1) % 1;
-    var dy2 = (((dd.fy + tSec * dd.dvy) % 1) + 1) % 1;
+    var dx2 = (((dd.fx + dT * dd.dvx) % 1) + 1) % 1;
+    var dy2 = (((dd.fy + dT * dd.dvy) % 1) + 1) % 1;
     pushI(dx2 * W, dy2 * H, dd.s, dd.s, 0, A.white, DEBRIS_RGB[0], DEBRIS_RGB[1], DEBRIS_RGB[2], 0.3, 1, 0);
   }
   // lower-left debris field: a nearer layer, so bigger, brighter, slower sway
   for (i = 0; i < DEBL.length; i++) {
     var dq = DEBL[i];
-    pushI(dq.fx * W + Math.sin(tSec * dq.w + dq.ph) * minDim * 0.02,
-      dq.fy * H + Math.sin(tSec * dq.w2 + dq.ph2) * minDim * 0.012,
+    pushI(dq.fx * W + Math.sin(dT * dq.w + dq.ph) * minDim * 0.02,
+      dq.fy * H + Math.sin(dT * dq.w2 + dq.ph2) * minDim * 0.012,
       dq.s, dq.s, 0, A.white, 0.30, 0.33, 0.40, 0.42, 1, 0);
   }
 
@@ -1921,16 +1993,16 @@ function drawGL(tSec) {
     var tl = b.heavy ? 0.26 : 0.16;
     var blen = Math.sqrt(b.vx * b.vx + b.vy * b.vy) * tl;
     var rot = Math.atan2(b.vy, b.vx);
-    var bh = b.heavy ? 8 : 4.2;
+    var bh = b.heavy ? 8 * HEAVY_SC : 4.2;
     pushI(b.x - b.vx * tl * 0.5, b.y - b.vy * tl * 0.5, blen, bh, rot, A.streak, BOLT_RGB[0], BOLT_RGB[1], BOLT_RGB[2], 0.9, 1, 0);
     pushI(b.x - b.vx * tl * 0.3, b.y - b.vy * tl * 0.3, blen * 0.55, bh * 0.36, rot, A.streak, 1, 1, 1, 0.95, 1, 0);
-    var gs = b.heavy ? 13 : 8;
+    var gs = b.heavy ? 13 * HEAVY_SC : 8;
     pushI(b.x, b.y, gs * 2, gs * 2, 0, A.g_red, 1, 1, 1, 0.8, 1, 0);
     pushI(b.x, b.y, gs, gs, 0, A.g_white, 1, 1, 1, 1, 1, 0);
     if (b.heavy && b.age < 0.3) {   // recoil-style muzzle flare on main guns
       var mf = 1 - b.age / 0.3;
-      pushI(b.sx, b.sy, 48, 48, 0, A.g_red, 1, 1, 1, mf * 0.9, 1, 0);
-      pushI(b.sx, b.sy, 20, 20, 0, A.g_white, 1, 1, 1, mf, 1, 0);
+      pushI(b.sx, b.sy, 48 * HEAVY_SC, 48 * HEAVY_SC, 0, A.g_red, 1, 1, 1, mf * 0.9, 1, 0);
+      pushI(b.sx, b.sy, 20 * HEAVY_SC, 20 * HEAVY_SC, 0, A.g_white, 1, 1, 1, mf, 1, 0);
     } else if (!b.heavy && b.age < 0.12) {
       pushI(b.sx, b.sy, 24, 24, 0, A.g_red, 1, 1, 1, (1 - b.age / 0.12) * 0.8, 1, 0);
     }

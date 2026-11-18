@@ -61,10 +61,16 @@ window.ROB64_DATA = {
 
   metrics: {
     commits: 23,          // -> debris density
-    tasksClosed: 14,      // -> extra lit windows on Order hulls
-    tasksOpen: 9,         // -> extra lit windows on Entropy hulls
+    fleetAVolume: 14,     // -> extra lit windows on order hulls
+    fleetBVolume: 9,      // -> extra lit windows on entropy hulls
     minutesLogged: 420,   // -> engine glow intensity (saturates at 600)
     calendarDensity: 0.55,// -> fighter busyness & fire rate
     uptimePct: 0.98       // -> starfield brightness
-  }
+  },
+
+  // Scene temper: -1 fully yin (the task list shrank — resolution,
+  // consolidation) .. +1 fully yang (it grew — ambition, expansion), 0
+  // balanced. Both poles are positive characters; this is never a score, and
+  // must not drive anything that reads as damage. Absent means 0.
+  temper: 0.42
 };
