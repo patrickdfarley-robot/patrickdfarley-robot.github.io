@@ -83,6 +83,7 @@ const CFG = {
   fps: 20,
   dprMax: 1.5,
   horizon: 1 / 3,        // horizon height: one part sky, two parts ground
+  bottomMargin: 0.10,    // keep the lowest tenth of the frame clear of objects
   curveFrac: 0.026,      // planet curvature: horizon bow, as a fraction of height
   lat: 40.7128,          // the sun follows the real sky over Gramercy
   lon: -74.0060,
@@ -1491,8 +1492,12 @@ function makeAtlas(PAL, rnd) {
 
 function makeView(W, H) {
   const horizonY = Math.round(H * CFG.horizon);
-  const ground = H - horizonY;
-  // Depth that lands exactly on the bottom edge.
+  // The near limit of the scene is held off the bottom edge. Cropping the
+  // foreground against the frame read as things being cut off rather than as
+  // depth, so the whole ground plane now ends short of it.
+  const bottomY = Math.round(H * (1 - CFG.bottomMargin));
+  const ground = bottomY - horizonY;
+  // Depth that lands exactly on that near limit.
   const zBottom = CFG.nearZ * 2 + 2;
   const focal = (ground / CFG.camH) * zBottom;
   // Planet curvature. The horizon bows: highest at the centre of the frame,
@@ -1501,7 +1506,7 @@ function makeView(W, H) {
   // feet — so one quadratic per sprite buys the whole effect.
   const curve = H * CFG.curveFrac;
   return {
-    W, H, horizonY, ground, zBottom, focal, curve,
+    W, H, horizonY, bottomY, ground, zBottom, focal, curve,
     scaleAt(z) { return focal / Math.max(z, 4); },
     halfWidthAt(z) { return (W * 0.5) / (focal / Math.max(z, 4)); },
     sy(z) { return horizonY + CFG.camH * (focal / Math.max(z, 4)); },
@@ -1541,7 +1546,7 @@ function buildWorld(d, view, atlas) {
   /* The settled band. A quiet week is a compact homestead; a busy week reaches
    * most of the way to the horizon. Both are complete pictures — the near end
    * never empties out, and the far end is never an unfinished edge. */
-  const zNear = view.zBottom - 3;
+  const zNear = view.zBottom + 2;
   const depthSpan = 16 + 64 * C.extent;
   const zFar = zNear + depthSpan;
   const place = (rho, spread, jitter) => {
@@ -1667,10 +1672,11 @@ function buildWorld(d, view, atlas) {
                           : (kind === 'craters' ? 'crater' : 'rock2'),
                    x: p.x, z: p.z, scale: 0.35 + 0.45 * rnd() });
   }
-  /* Right under the camera, partly cropped by the bottom edge: foreground
-   * scatter is what makes the frame feel stood in rather than looked at. */
+  /* Just inside the near limit: foreground scatter is what makes the frame
+   * feel stood in rather than looked at. It used to run past the bottom edge
+   * and crop, which Patrick read as objects being cut off (2026-11-18). */
   for (let i = 0; i < 14; i++) {
-    const z = view.zBottom - 9 + rnd() * 12;
+    const z = view.zBottom + 1 + rnd() * 13;
     const x = (rnd() * 2 - 1) * view.halfWidthAt(z) * 0.98;
     const r = rnd();
     terrain.push({ sprite: r < 0.55 ? 'rock' + (i % 3) : (r < 0.8 ? 'plant' : 'moss'),
@@ -2202,7 +2208,7 @@ function makeScene(d, world, atlas) {
         const u = ((now * speed + seed * 7.3) % 1);
         const yv = (seed * 13.7) % 1;
         const px = spore ? u * (view.W + 120) - 60 : (1 - u) * (view.W + 160) - 80;
-        const py = view.horizonY + yv * (view.H - view.horizonY)
+        const py = view.horizonY + yv * (view.bottomY - view.horizonY)
                  + (spore ? Math.sin(now * 0.7 + k) * 14 : 0);
         const sz = (spore ? 3 : 4) + seed * (spore ? 4 : 9);
         const a = (spore ? 0.4 : 0.16) * (0.35 + 0.65 * Math.sin(Math.PI * u));
@@ -2770,7 +2776,7 @@ function main() {
   const interval = 1000 / fpsCap;
   let last = -1e9;
   const started = performance.now();
-  let perfSum = 0, perfN = 0, perfMax = 0, perfInst = 0, perfAdd = 0;
+  let perfSum = 0, perfN = 0, perfMax = 0, perfInst = 0, perfAdd = 0, perfLowY = 0;
 
   function tick(ts) {
     requestAnimationFrame(tick);
@@ -2784,6 +2790,12 @@ function main() {
     perfSum += cost; perfN++;
     if (cost > perfMax && perfN > 4) perfMax = cost;
     perfInst = f.nBase; perfAdd = f.nAdd;
+    let low = 0;
+    for (let i = 0; i < f.nBase; i++) {
+      const b = f.base[i].y + f.base[i].h / 2;
+      if (b > low) low = b;
+    }
+    perfLowY = Math.round(low);
   }
   window.LANDFALL_RESET_PERF = () => { perfSum = 0; perfN = 0; perfMax = 0; };
   requestAnimationFrame(tick);
@@ -2802,7 +2814,9 @@ function main() {
                sunDeg: Math.round(solarElevation(new Date(), data.lat, data.lon).el * 10) / 10,
                perf: { frames: perfN, avgMs: perfN ? Math.round(perfSum / perfN * 100) / 100 : 0,
                        maxMs: Math.round(perfMax * 100) / 100,
-                       instances: perfInst, additive: perfAdd } };
+                       instances: perfInst, additive: perfAdd,
+                       lowestSpritePx: perfLowY, bottomLimitPx: view.bottomY,
+                       framePx: H } };
     }
   };
 }
