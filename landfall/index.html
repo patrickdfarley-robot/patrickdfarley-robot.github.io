@@ -169,7 +169,13 @@ function solarElevation(date, lat, lon) {
   const ha = (trueSolar / 4 - 180) * rad;
   const latR = lat * rad;
   const cosZ = Math.sin(latR) * Math.sin(decl) + Math.cos(latR) * Math.cos(decl) * Math.cos(ha);
-  return Math.asin(clamp(cosZ, -1, 1)) / rad;
+  const zen = Math.acos(clamp(cosZ, -1, 1));
+  // Azimuth, measured from north through east, so the sun can actually be
+  // placed in the sky rather than only raising and lowering the lights.
+  let az = Math.atan2(-Math.sin(ha),
+                      Math.tan(decl) * Math.cos(latR) - Math.sin(latR) * Math.cos(ha)) / rad;
+  az = (az + 360) % 360;
+  return { el: 90 - zen / rad, az };
 }
 
 /* ------------------------------------------------------------- read the data */
@@ -296,6 +302,7 @@ function buildPalette(d) {
     metal:    { h: (P.skyHue + 180) % 360, s: 10, h2: 0, s2: 0, l: 76 },
     suit:     { h: 36, s: 72, l: 66 },
     suitAlt:  { h: (P.vegHue + 30) % 360, s: 54, l: 62 },
+    suitC:    { h: (P.skyHue + 140) % 360, s: 46, l: 58 },
     accent:   { h: (P.skyHue + 200) % 360, s: 44, l: 52 },
     lamp:     { h: 42, s: 92, l: 72 }
   };
@@ -955,9 +962,32 @@ function makeAtlas(PAL, rnd) {
     };
   }
   const walkPhases = [0, 0.85, 0, -0.85];
-  for (let i = 0; i < 4; i++) {
-    bake('crew' + i, 46, 64, 1.85, 0.99, (g, w, h) => colonist(C.suit)(g, w, h, walkPhases[i]));
-    bake('crewB' + i, 46, 64, 1.85, 0.99, (g, w, h) => colonist(C.suitAlt)(g, w, h, walkPhases[i]));
+  const SUITS = [C.suit, C.suitAlt, C.suitC];
+  const CREW_PREFIX = ['crew', 'crewB', 'crewC'];
+  for (let v = 0; v < 3; v++) {
+    for (let i = 0; i < 4; i++) {
+      bake(CREW_PREFIX[v] + i, 46, 64, 1.85, 0.99,
+           (g, w, h) => colonist(SUITS[v])(g, w, h, walkPhases[i]));
+    }
+  }
+  /* Carrying a crate: the pose that makes a crowd look like it has errands. */
+  for (let v = 0; v < 3; v++) {
+    bake(CREW_PREFIX[v] + 'Carry', 46, 64, 1.85, 0.99, (g, w, h) => {
+      colonist(SUITS[v])(g, w, h, 0.2);
+      const cx = w * 0.5;
+      g.fillStyle = col(C.metal, -6);
+      roundRect(g, cx - w * 0.02, h * 0.5, w * 0.34, h * 0.2, w * 0.03);
+      g.fill();
+      g.strokeStyle = col(C.metal, -34, 0.8);
+      g.lineWidth = w * 0.03;
+      g.stroke();
+      g.strokeStyle = col(SUITS[v], -8);
+      g.lineWidth = w * 0.12;
+      g.lineCap = 'round';
+      g.beginPath();
+      g.moveTo(cx + w * 0.16, h * 0.44); g.lineTo(cx + w * 0.24, h * 0.56);
+      g.stroke();
+    });
   }
   /* Working pose: arms up, holding something. Used at build sites. */
   bake('crewWork', 46, 64, 1.85, 0.99, (g, w, h) => {
@@ -1210,42 +1240,123 @@ function makeAtlas(PAL, rnd) {
     }
     meltBase(g, w, h, 0.1);
   });
-  bake('moss', 140, 56, 9, 0.88, (g, w, h) => {
+  /* Moss: clustered pads with their own light and shade, not flat discs. */
+  bake('moss', 150, 62, 9, 0.9, (g, w, h) => {
     const rr = mulberry32(0x0A055);
-    for (let i = 0; i < 14; i++) {
-      g.fillStyle = col(C.veg, -6 + rr() * 18, 0.55 + rr() * 0.3);
-      const x = w * (0.1 + rr() * 0.8), y = h * (0.5 + rr() * 0.42);
-      g.beginPath(); g.ellipse(x, y, w * (0.07 + rr() * 0.08), h * (0.07 + rr() * 0.08), 0, 0, TAU); g.fill();
+    const pads = [];
+    for (let i = 0; i < 16; i++) {
+      pads.push({ x: w * (0.1 + rr() * 0.8), y: h * (0.46 + rr() * 0.44),
+                  r: w * (0.07 + rr() * 0.09), t: rr() });
+    }
+    pads.sort((p, q) => p.y - q.y);
+    for (const pd of pads) {
+      g.fillStyle = col(C.veg, -16, 0.35);
+      g.beginPath();
+      g.ellipse(pd.x + pd.r * 0.2, pd.y + pd.r * 0.26, pd.r * 1.02, pd.r * 0.5, 0, 0, TAU);
+      g.fill();
+      const grad = g.createLinearGradient(pd.x - pd.r, pd.y - pd.r, pd.x + pd.r * 0.5, pd.y + pd.r);
+      grad.addColorStop(0, col(C.vegLit, 8 + pd.t * 10, 0.95));
+      grad.addColorStop(1, col(C.veg, -6 - pd.t * 8, 0.95));
+      g.fillStyle = grad;
+      g.beginPath();
+      g.ellipse(pd.x, pd.y, pd.r, pd.r * 0.56, 0, 0, TAU);
+      g.fill();
+      // a few fronds breaking the outline, so it is not a disc
+      g.strokeStyle = col(C.veg, 4, 0.8);
+      g.lineWidth = Math.max(1, pd.r * 0.1);
+      for (let k = 0; k < 3; k++) {
+        const ang = rr() * TAU;
+        g.beginPath();
+        g.moveTo(pd.x, pd.y);
+        g.lineTo(pd.x + Math.cos(ang) * pd.r * 1.25, pd.y + Math.sin(ang) * pd.r * 0.7);
+        g.stroke();
+      }
     }
   });
-  bake('plant', 54, 62, 1.3, 0.97, (g, w, h) => {
-    g.strokeStyle = col(C.veg, -10);
-    g.lineWidth = w * 0.07;
+  /* A shrub: taller growth, for variety against the flat pads. */
+  bake('shrub', 90, 86, 2.6, 0.97, (g, w, h) => {
+    const rr = mulberry32(0x5B07);
+    g.strokeStyle = col(C.veg, -22);
+    g.lineWidth = w * 0.05;
     g.lineCap = 'round';
-    for (const s of [-1, -0.3, 0.4, 1]) {
+    for (let i = 0; i < 5; i++) {
+      const lean = (i / 4 - 0.5) * 1.6;
       g.beginPath();
-      g.moveTo(w * 0.5, h * 0.96);
-      g.quadraticCurveTo(w * (0.5 + s * 0.22), h * 0.6, w * (0.5 + s * 0.36), h * 0.22);
+      g.moveTo(w * 0.5, h * 0.97);
+      g.quadraticCurveTo(w * (0.5 + lean * 0.14), h * 0.6, w * (0.5 + lean * 0.3), h * 0.3);
       g.stroke();
     }
-    g.fillStyle = col(C.vegLit, 8);
-    for (const s of [-1, -0.3, 0.4, 1]) {
-      g.beginPath();
-      g.ellipse(w * (0.5 + s * 0.36), h * 0.2, w * 0.1, h * 0.07, s * 0.6, 0, TAU);
-      g.fill();
+    const blobs = [];
+    for (let i = 0; i < 9; i++) {
+      blobs.push([w * (0.2 + rr() * 0.6), h * (0.12 + rr() * 0.42), w * (0.12 + rr() * 0.12)]);
+    }
+    blobs.sort((p, q) => q[1] - p[1]);
+    for (const [bx, by, br] of blobs) {
+      const grad = g.createRadialGradient(bx - br * 0.4, by - br * 0.4, br * 0.1, bx, by, br);
+      grad.addColorStop(0, col(C.vegLit, 14));
+      grad.addColorStop(1, col(C.veg, -10));
+      g.fillStyle = grad;
+      g.beginPath(); g.arc(bx, by, br, 0, TAU); g.fill();
     }
   });
-  bake('pond', 240, 80, 16, 0.78, (g, w, h) => {
-    const grad = g.createLinearGradient(0, h * 0.3, w * 0.5, h);
-    grad.addColorStop(0, col(C.water, 18, 0.92));
-    grad.addColorStop(1, col(C.water, -14, 0.92));
+  bake('plant', 56, 66, 1.4, 0.97, (g, w, h) => {
+    g.strokeStyle = col(C.veg, -14);
+    g.lineWidth = w * 0.075;
+    g.lineCap = 'round';
+    for (const sp of [-1, -0.34, 0.4, 1]) {
+      g.beginPath();
+      g.moveTo(w * 0.5, h * 0.96);
+      g.quadraticCurveTo(w * (0.5 + sp * 0.2), h * 0.58, w * (0.5 + sp * 0.34), h * 0.2);
+      g.stroke();
+    }
+    for (const sp of [-1, -0.34, 0.4, 1]) {
+      const lx = w * (0.5 + sp * 0.34), ly = h * 0.18;
+      const grad = g.createLinearGradient(lx - w * 0.1, ly - h * 0.06, lx + w * 0.1, ly + h * 0.06);
+      grad.addColorStop(0, col(C.vegLit, 14));
+      grad.addColorStop(1, col(C.veg, -4));
+      g.fillStyle = grad;
+      g.beginPath();
+      g.ellipse(lx, ly, w * 0.11, h * 0.075, sp * 0.6, 0, TAU);
+      g.fill();
+    }
+    g.fillStyle = col(C.lamp, 6, 0.8);
+    g.beginPath(); g.arc(w * 0.5, h * 0.14, w * 0.045, 0, TAU); g.fill();
+  });
+  /* Water: a shore, a sky reflection, and ripples. A flat blue ellipse was
+   * reading as spilled paint. */
+  bake('pond', 250, 92, 16, 0.8, (g, w, h) => {
+    const rr = mulberry32(0x9A7E);
+    // damp shore
+    g.fillStyle = col(C.ground, -13, 0.55);
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.49, h * 0.33, 0, 0, TAU); g.fill();
+    const grad = g.createLinearGradient(0, h * 0.28, w * 0.4, h);
+    grad.addColorStop(0, col(C.water, 22, 0.95));
+    grad.addColorStop(0.55, col(C.water, 2, 0.95));
+    grad.addColorStop(1, col(C.water, -16, 0.95));
     g.fillStyle = grad;
-    g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.45, h * 0.3, 0, 0, TAU); g.fill();
-    g.strokeStyle = col(C.veg, 6, 0.7);
-    g.lineWidth = h * 0.05;
-    g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.46, h * 0.31, 0, 0, TAU); g.stroke();
-    g.fillStyle = 'rgba(255,255,255,0.35)';
-    g.beginPath(); g.ellipse(w * 0.38, h * 0.48, w * 0.12, h * 0.04, -0.1, 0, TAU); g.fill();
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.43, h * 0.27, 0, 0, TAU); g.fill();
+    // sky reflected along the near edge
+    g.fillStyle = col(C.sky, 16, 0.3);
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.72, w * 0.36, h * 0.1, 0, 0, TAU); g.fill();
+    // ripples
+    g.strokeStyle = 'rgba(255,255,255,0.3)';
+    for (let i = 0; i < 5; i++) {
+      g.lineWidth = Math.max(1, h * 0.015);
+      const ry = h * (0.46 + rr() * 0.26), rw = w * (0.06 + rr() * 0.16);
+      g.beginPath();
+      g.ellipse(w * (0.25 + rr() * 0.5), ry, rw, h * 0.012, 0, 0, Math.PI);
+      g.stroke();
+    }
+    // reeds on one bank
+    g.strokeStyle = col(C.veg, -6, 0.9);
+    g.lineWidth = Math.max(1, w * 0.008);
+    for (let i = 0; i < 7; i++) {
+      const bx = w * (0.14 + rr() * 0.22), by = h * (0.62 + rr() * 0.16);
+      g.beginPath();
+      g.moveTo(bx, by);
+      g.quadraticCurveTo(bx + w * 0.01, by - h * 0.14, bx + w * 0.03, by - h * 0.22);
+      g.stroke();
+    }
   });
   bake('road', 200, 70, 13, 0.55, (g, w, h) => {
     g.filter = 'blur(6px)';
@@ -1256,6 +1367,35 @@ function makeAtlas(PAL, rnd) {
     g.beginPath(); g.ellipse(w * 0.5, h * 0.46, w * 0.3, h * 0.1, 0, 0, TAU); g.fill();
     g.filter = 'none';
   });
+
+  /* ------------------------------------------------------------------ sky */
+  for (let i = 0; i < 2; i++) {
+    const rr = mulberry32(0xC10D + i);
+    bake('cloud' + i, 420, 110, 60, 0.5, (g, w, h) => {
+      g.filter = 'blur(9px)';
+      for (let k = 0; k < 11; k++) {
+        const t = k / 10;
+        const cx = w * (0.08 + t * 0.84);
+        const lift = Math.sin(t * Math.PI) * (0.3 + rr() * 0.3);
+        g.fillStyle = `rgba(255,255,255,${(0.1 + rr() * 0.16).toFixed(3)})`;
+        g.beginPath();
+        g.ellipse(cx, h * (0.62 - lift * 0.22), w * (0.06 + rr() * 0.08),
+                  h * (0.07 + lift * 0.2), 0, 0, TAU);
+        g.fill();
+      }
+      // a brighter upper edge, where the light would catch
+      g.filter = 'blur(5px)';
+      for (let k = 0; k < 7; k++) {
+        const t = k / 6;
+        g.fillStyle = `rgba(255,255,255,${(0.08 + rr() * 0.1).toFixed(3)})`;
+        g.beginPath();
+        g.ellipse(w * (0.14 + t * 0.72), h * (0.44 - Math.sin(t * Math.PI) * 0.12),
+                  w * (0.05 + rr() * 0.05), h * 0.05, 0, 0, TAU);
+        g.fill();
+      }
+      g.filter = 'none';
+    });
+  }
 
   /* -------------------------------------------------------------------- fx */
   function radial(g, w, h, stops) {
@@ -1452,7 +1592,8 @@ function buildWorld(d, view, atlas) {
   const nVeg = Math.round(10 + 54 * C.terraform);
   for (let i = 0; i < nVeg; i++) {
     const p = place(rnd() * (0.3 + 0.8 * C.terraform), 1, rnd());
-    veg.push({ sprite: rnd() < 0.4 + 0.3 * C.terraform ? 'moss' : 'plant',
+    const roll = rnd();
+    veg.push({ sprite: roll < 0.42 + 0.22 * C.terraform ? 'moss' : (roll < 0.78 ? 'shrub' : 'plant'),
                x: p.x, z: p.z, scale: 0.5 + 0.8 * rnd() });
   }
   const ponds = [];
@@ -1511,7 +1652,8 @@ function buildWorld(d, view, atlas) {
       ax: a.x + (rnd() - 0.5) * 9, az: a.z + (rnd() - 0.5) * 5,
       bx: b.x + (rnd() - 0.5) * 9, bz: b.z + (rnd() - 0.5) * 5,
       period, phase: rnd(), dwell: 0.2 + 0.3 * rnd(),
-      alt: rnd() < 0.42, home: a
+      v: Math.floor(rnd() * 3), carry: rnd() < 0.22,
+      sz: 0.9 + rnd() * 0.2, home: a
     });
   }
 
@@ -1562,9 +1704,11 @@ function bakeBackdrop(d, world, atlas, PAL, W, H) {
 
   /* ------------------------------------------------------------------- sky */
   const sky = g.createLinearGradient(0, 0, 0, hy);
-  sky.addColorStop(0, col(C.skyHigh, -6));
-  sky.addColorStop(0.62, col(C.sky, 2));
-  sky.addColorStop(1, col(C.haze, 6));
+  sky.addColorStop(0, col(C.skyHigh, -10));
+  sky.addColorStop(0.38, col(C.skyHigh, 4));
+  sky.addColorStop(0.72, col(C.sky, 4));
+  sky.addColorStop(0.9, col(C.haze, 2));
+  sky.addColorStop(1, col(C.haze, 8));
   g.fillStyle = sky;
   g.fillRect(0, 0, W, hmax);
 
@@ -1583,11 +1727,11 @@ function bakeBackdrop(d, world, atlas, PAL, W, H) {
     const r = H * (0.028 + rnd() * 0.045);
     const x = W * (0.12 + rnd() * 0.76), y = hy * (0.14 + rnd() * 0.46);
     const grad = g.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.1, x, y, r);
-    grad.addColorStop(0, col(C.haze, 18, 0.95));
-    grad.addColorStop(1, col(C.haze, -16, 0.8));
+    grad.addColorStop(0, col(C.haze, 18, 0.62));
+    grad.addColorStop(1, col(C.haze, -16, 0.46));
     g.fillStyle = grad;
     g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
-    g.fillStyle = col(C.haze, -26, 0.35);
+    g.fillStyle = col(C.haze, -26, 0.22);
     for (let k = 0; k < 4; k++) {
       const a = rnd() * TAU, rr = r * (0.1 + rnd() * 0.3);
       g.beginPath();
@@ -1728,7 +1872,8 @@ function bakeBackdrop(d, world, atlas, PAL, W, H) {
     const px = view.sx(x, z);
     const py = view.sy(z) + view.curveAt(view.sx(x, z), view.sy(z));
     if (px + w < -40 || px - w > W + 40 || py < hy - 10 || py - h > H + 10) return;
-    g.globalAlpha = alpha === undefined ? 1 : alpha;
+    const haze = 1 - 0.66 * clamp((z - view.zBottom) / 260, 0, 1);
+    g.globalAlpha = (alpha === undefined ? 1 : alpha) * haze;
     g.drawImage(atlas.canvas, sp.x, sp.y, sp.w, sp.h,
                 px - w / 2, py - h * sp.anchorY, w, h);
     g.globalAlpha = 1;
@@ -1797,10 +1942,18 @@ function makeScene(d, world, atlas) {
     it.a = alpha;
     if (additive) nAdd = n + 1; else nBase = n + 1;
   }
+  /* How much of the air you are looking through. 1 at the camera, falling to
+   * HAZE_FLOOR out at the horizon. */
+  const HAZE_FLOOR = 0.34;
+  function hazeAt(z) {
+    return 1 - (1 - HAZE_FLOOR) * clamp((z - view.zBottom) / 260, 0, 1);
+  }
+
   /* World-space emit: metres and depth in, pixels out. */
   function world2(spriteName, x, z, scale, alpha, additive) {
     const sp = SP[spriteName];
     if (!sp || z < 5) return;
+    alpha *= hazeAt(z);
     const s = view.scaleAt(z);
     const wpx = sp.metres * scale * s;
     if (wpx < 0.6) return;
@@ -1818,7 +1971,7 @@ function makeScene(d, world, atlas) {
   /* The sun, read from the machine clock and recomputed every 20 s — it moves
    * a quarter of a degree in that time, and this way the trig is not 20 times
    * a second for nothing. */
-  let sunAt = -1e9, sunEl = 0;
+  let sunAt = -1e9, sunEl = { el: 0, az: 180 };
   function sunElevation() {
     const ms = Date.now();
     if (ms - sunAt < 20000) return sunEl;
@@ -1860,17 +2013,44 @@ function makeScene(d, world, atlas) {
   });
 
   /* Walk-cycle frame from distance covered, so feet match speed. */
-  function crewSprite(alt, dist, moving) {
-    if (!moving) return alt ? 'crewB0' : 'crew0';
-    const f = Math.floor(dist * 1.35) & 3;
-    return (alt ? 'crewB' : 'crew') + f;
+  const CREW = ['crew', 'crewB', 'crewC'];
+  function crewSprite(v, dist, moving) {
+    const p = CREW[v % 3];
+    if (!moving) return p + '0';
+    return p + (Math.floor(dist * 1.35) & 3);
   }
 
   /* ----------------------------------------------------------------- build */
   function frame(now) {
     nBase = 0; nAdd = 0; nDyn = 0;
     const t = (now % CFG.loopSec) / CFG.loopSec;
-    const L = lighting(sunElevation());
+    const S = sunElevation();
+    const L = lighting(S.el);
+
+    /* -- sky: the sun where it actually is, and drifting high cloud -------
+     * The top third was the emptiest part of the frame once the ground was
+     * detailed. Seven instances buy a sun, its halo, and a cloud deck. */
+    {
+      // Azimuth 180 (due south) sits at frame centre; the sun tracks across.
+      const sx = view.W * 0.5 + ((S.az - 180) / 95) * view.W * 0.5;
+      const sy = view.hcurve(sx) - clamp(S.el / 58, -0.08, 1) * view.horizonY * 0.92;
+      if (S.el > -7 && sx > -view.W * 0.2 && sx < view.W * 1.2) {
+        const rise = clamp(1 - Math.abs(S.el) / 14, 0, 1);   // fat and warm near the horizon
+        const r = view.H * (0.012 + rise * 0.009);
+        emit('glow', sx, sy, r * (14 + rise * 12), 0.09 + 0.2 * rise, 0.5, 1, true);
+        emit('flash', sx, sy, r * 4.5, 0.3 + 0.35 * rise, 0.5, 1, true);
+        emit('flash', sx, sy, r * 1.15, 1, 0.5, 1, true);
+      }
+      for (let k = 0; k < 5; k++) {
+        const seed = (k * 0.6180339887) % 1;
+        const u = ((now * (0.0016 + seed * 0.0022) + seed) % 1.25) - 0.125;
+        const cx = u * view.W;
+        const cy = view.horizonY * (0.16 + seed * 0.6);
+        const cw = view.W * (0.16 + seed * 0.2);
+        emit('cloud' + (k % 2), cx, cy, cw, (0.1 + 0.14 * seed) * (0.4 + 0.6 * L.lum),
+             0.5, SP['cloud' + (k % 2)].aspect, false);
+      }
+    }
 
     /* -- structures. Lit windows come up as the light goes down. --------- */
     for (const s of world.sites) {
@@ -1910,9 +2090,11 @@ function makeScene(d, world, atlas) {
       let sprite;
       if (!moving) {
         // Standing: at a work site they work, at the plaza they mill about.
-        sprite = (f > 0.5 && c.home !== world.plaza) ? 'crewWork' : (c.alt ? 'crewB0' : 'crew0');
-      } else sprite = crewSprite(c.alt, dist, true);
-      pushDyn(sprite, '', x, z, 1, 1, 1);
+        sprite = (f > 0.5 && c.home !== world.plaza) ? 'crewWork' : crewSprite(c.v, 0, false);
+      } else if (c.carry) {
+        sprite = CREW[c.v % 3] + 'Carry';
+      } else sprite = crewSprite(c.v, dist, true);
+      pushDyn(sprite, '', x, z, c.sz, 1, 1);
       // Headlamp after dark. Nobody works in the dark unlit.
       if (L.nf > 0.25) {
         const sc = view.scaleAt(z);
@@ -1989,16 +2171,25 @@ function makeScene(d, world, atlas) {
       while (j >= 0 && dyn[j].z < it.z) { dyn[j + 1] = dyn[j]; j--; }
       dyn[j + 1] = it;
     }
+    // Where the sun is, in screen terms, and how long a shadow it throws.
+    const sunX = view.W * 0.5 + ((S.az - 180) / 95) * view.W * 0.5;
+    const stretch = clamp(1 / Math.tan(Math.max(S.el, 5) * Math.PI / 180), 0.45, 3.4);
+    const shadowA = 0.34 * L.lum * clamp(S.el / 10, 0, 1);
+
     for (let i = 0; i < nDyn; i++) {
       const it = dyn[i];
-      if (it.shadow > 0) {
+      if (it.shadow > 0 && shadowA > 0.01) {
         const sp = SP[it.sprite];
         const sc = view.scaleAt(it.z);
         if (sp) {
           const wpx = sp.metres * it.scale * sc;
           const hpx = wpx * sp.aspect;
-          emit('shadow', view.sx(it.x, it.z) + hpx * 0.34, view.sy(it.z) + hpx * 0.04,
-               (wpx * 0.9 + hpx * 0.7) * it.shadow, 0.34 * L.lum, 0.5,
+          const px = view.sx(it.x, it.z);
+          const away = px >= sunX ? 1 : -1;        // the shadow falls away from the sun
+          const reach = hpx * 0.3 * stretch;
+          emit('shadow', px + away * reach, view.sy(it.z) + hpx * 0.04,
+               (wpx * 0.9 + reach * 1.5) * it.shadow,
+               shadowA / (0.7 + stretch * 0.3), 0.5,
                SP.shadow.aspect, false);
         }
       }
@@ -2066,7 +2257,8 @@ function makeScene(d, world, atlas) {
           const r = 4 + 5 * ((k * 37 % 13) / 13);
           const x = pz.x + Math.cos(a) * r, z = pz.z + Math.sin(a) * r * 0.42;
           const wave = ((k + Math.floor(local * 0.7)) % 3 === 0);
-          pushDyn(wave ? 'crewWave' : (k & 1 ? 'crewB0' : 'crew0'), '', x, z, 1, grow, 1);
+          pushDyn(wave ? 'crewWave' : crewSprite(k, 0, false), '', x, z,
+                  0.92 + ((k * 13) % 7) / 40, grow, 1);
         }
         const sc = sc0(pz.z);
         emit('glow', view.sx(pz.x, pz.z), view.sy(pz.z) - 6 * sc,
@@ -2085,8 +2277,8 @@ function makeScene(d, world, atlas) {
         const fade = clamp((1 - p) * 3.4, 0, 1) * clamp(p * 8, 0, 1);
         pushDyn('rover', '', x, z, 0.95, fade, 1);
         if (p < 0.55) {
-          pushDyn(crewSprite(false, now * 2, true), '', x - 3.4, z + 1.1, 1, fade, 1);
-          pushDyn(crewSprite(true, now * 2 + 0.5, true), '', x + 3.6, z - 0.6, 1, fade, 1);
+          pushDyn(crewSprite(0, now * 2, true), '', x - 3.4, z + 1.1, 1, fade, 1);
+          pushDyn(crewSprite(2, now * 2 + 0.5, true), '', x + 3.6, z - 0.6, 1, fade, 1);
         }
         const sc = sc0(z);
         for (let k = 0; k < 3; k++) {
@@ -2525,7 +2717,7 @@ function makeC2D(canvas, atlasCanvas) {
                temper: data.temper, seed: data.seed,
                sites: world.sites.length, crew: world.crew.length,
                events: data.events.length, size: [W, H],
-               sunDeg: Math.round(solarElevation(new Date(), data.lat, data.lon) * 10) / 10,
+               sunDeg: Math.round(solarElevation(new Date(), data.lat, data.lon).el * 10) / 10,
                perf: { frames: perfN, avgMs: perfN ? Math.round(perfSum / perfN * 100) / 100 : 0,
                        maxMs: Math.round(perfMax * 100) / 100,
                        instances: perfInst, additive: perfAdd } };
