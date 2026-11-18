@@ -11,7 +11,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<script src="colony-data.js"></script>
+<script src="scene-params.js"></script>
 <script>
 /* ===========================================================================
  * LANDFALL — a data-driven colonization wallpaper for ROB64.
@@ -21,7 +21,7 @@
  * a weekly-seeded planet. Horizon at mid-frame, little people in spacesuits,
  * rovers, habs, greenhouses, terraforming rigs.
  *
- * Reads window.ROB64_COLONY, set by a sibling colony-data.js (no fetch; works
+ * Reads window.SCENE_PARAMS, set by a sibling colony-data.js (no fetch; works
  * on file://). Every field is optional; a built-in sample renders if the file
  * is missing or malformed. Contract: ../landfall-wallpaper/SCHEMA.md.
  *
@@ -178,11 +178,58 @@ function solarElevation(date, lat, lon) {
   return { el: 90 - zen / rad, az };
 }
 
+/* ------------------------------------------------------------- camouflage
+ * The file that ships to the desktop syncs through a cloud account, so it is
+ * packed into something that reads as a renderer config: field names are
+ * plausible graphics settings, enums are indices, the week's dates are gone
+ * (only the integer seed they fed survives), and the contributor labels are
+ * dropped outright — the scene never rendered them.
+ *
+ * This is obfuscation, not encryption. The decoder ships with the renderer,
+ * so anyone holding both can read it; what it buys is that the data file ALONE
+ * says nothing. These four tables are the key and are mirrored in
+ * scripts/fleet-data.py (PACK_STRUCT_ORDER / PACK_EVENT_ORDER /
+ * COLONY_TERRAIN / COLONY_WEATHER). Reorder one side and the scene silently
+ * renders the wrong week.
+ *
+ * The readable schema is still accepted, which is what the committed sample
+ * and the public preview use. */
+const STRUCT_ORDER = ['lander', 'hab', 'dome', 'fab', 'rig', 'mast', 'depot',
+                      'tower', 'solar'];
+const EVENT_ORDER = ['build', 'haul', 'gather', 'expedition', 'survey', 'incursion'];
+const TERRAIN_ORDER = ['dunes', 'ridges', 'craters', 'flats'];
+const WEATHER_ORDER = ['clear', 'dust', 'spores'];
+
+function unpack(raw) {
+  const P = raw.palette || {}, Q = raw.params || {};
+  const n = Array.isArray(raw.nodes) ? raw.nodes : [];
+  const b = Array.isArray(raw.beats) ? raw.beats : [];
+  return {
+    _seed: raw.seed,
+    planet: {
+      skyHue: P.hueA, groundHue: P.hueB, rockHue: P.hueC, vegHue: P.hueD,
+      terrain: TERRAIN_ORDER[P.mesh], moons: P.sprites,
+      ring: P.arc === undefined ? undefined : !!P.arc,
+      weather: WEATHER_ORDER[P.particles]
+    },
+    colony: { extent: Q.spread, bustle: Q.density, industry: Q.rateA,
+              community: Q.rateB, terraform: Q.bloom },
+    temper: Q.bias,
+    metrics: { uptimePct: Q.gain },
+    structures: n.map(e => ({ kind: STRUCT_ORDER[e[0]], scale: e[1], label: '', stage: 1 })),
+    events: b.map(e => ({ t: e[0], kind: EVENT_ORDER[e[1]], magnitude: e[2] }))
+  };
+}
+
 /* ------------------------------------------------------------- read the data */
 function readData() {
   let raw = null;
-  try { raw = window.ROB64_COLONY; } catch (e) { raw = null; }
+  try { raw = window.SCENE_PARAMS; } catch (e) { raw = null; }
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = SAMPLE;
+  // The packed form is recognised by its `params` block; the readable schema
+  // is still accepted so the sample and the public preview keep working.
+  const packedSeed = (raw.params && typeof raw.params === 'object')
+    ? (raw = unpack(raw))._seed : null;
 
   const d = {};
   d.generated = typeof raw.generated === 'string' ? raw.generated : 'rob64';
@@ -192,7 +239,8 @@ function readData() {
 
   /* The seed is the week start, so staging holds all week while the data under
    * it moves — same rule as Fleet Action. */
-  const seed = fnv1a('landfall|' + d.generated);
+  const seed = (typeof packedSeed === 'number' && isFinite(packedSeed))
+    ? (packedSeed >>> 0) : fnv1a('landfall|' + d.generated);
   const srnd = mulberry32(seed);
   const pal = seedPlanet(srnd);
 

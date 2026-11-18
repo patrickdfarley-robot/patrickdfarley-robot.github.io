@@ -1,9 +1,9 @@
 /* ROB64 Landfall — SYNTHETIC sample data, safe to publish.
- * Mirrors the built-in sample in colony.html. The real colony-data.js is
+ * Mirrors the built-in sample in colony.html. The real scene-params.js is
  * written by scripts/fleet-data.py to OneDrive and to a local test copy and is
  * never committed. See SCHEMA.md § Privacy.
  */
-window.ROB64_COLONY = {
+window.SCENE_PARAMS = {
   generated: '2026-11-16T00:00:00-05:00',
   window: { start: '2026-11-16', end: '2026-11-22' },
   planet: { skyHue: 206, groundHue: 28, rockHue: 20, vegHue: 142,
