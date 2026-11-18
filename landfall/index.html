@@ -1,0 +1,2232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ROB64 — Landfall</title>
+<style>
+  html,body{margin:0;padding:0;background:#05070c;overflow:hidden;width:100%;height:100%}
+  canvas{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="colony-data.js"></script>
+<script>
+/* ===========================================================================
+ * LANDFALL — a data-driven colonization wallpaper for ROB64.
+ *
+ * Branch of Fleet Action (projects/starfield-wallpaper/battle.html). Same
+ * pipeline, same week, different scene: an aerial oblique view of a colony on
+ * a weekly-seeded planet. Horizon at mid-frame, little people in spacesuits,
+ * rovers, habs, greenhouses, terraforming rigs.
+ *
+ * Reads window.ROB64_COLONY, set by a sibling colony-data.js (no fetch; works
+ * on file://). Every field is optional; a built-in sample renders if the file
+ * is missing or malformed. Contract: ../landfall-wallpaper/SCHEMA.md.
+ *
+ * BINDING RULE, inherited and non-negotiable: descriptive, never evaluative.
+ * Nothing here encodes a score, target, streak or comparison against a goal.
+ * A quiet week is a serene homestead; a busy week is a boomtown. Both are
+ * finished, charming scenes. No colonist dies, nothing decays, no structure
+ * ever shows damage, and the weekly reset means nothing accumulates across
+ * weeks. `temper`'s two poles (frontier push / consolidation) must look
+ * equally alive — a viewer must not be able to tell which one is "good".
+ *
+ * Two render paths: WebGL2 instanced sprites (default) and Canvas 2D
+ * (fallback on context-creation, shader-compile or context-loss failure).
+ * Both consume the same per-frame instance list, so they agree by
+ * construction. All sprites are procedurally baked into one atlas at boot —
+ * no external assets, no libraries, no network.
+ * ======================================================================== */
+
+'use strict';
+
+/* --------------------------------------------------------------- sample data
+ * Synthetic, safe to publish. Mirrors the real emitter's shape. */
+const SAMPLE = {
+  generated: '2026-11-16T00:00:00-05:00',
+  window: { start: '2026-11-16', end: '2026-11-22' },
+  planet: { skyHue: 206, groundHue: 28, rockHue: 20, vegHue: 142,
+            terrain: 'ridges', moons: 2, ring: true, weather: 'dust' },
+  colony: { extent: 0.58, bustle: 0.55, industry: 0.52, community: 0.48,
+            terraform: 0.45 },
+  temper: 0.22,
+  structures: [
+    { kind: 'lander',  label: 'LANDFALL',  scale: 0.9, stage: 1 },
+    { kind: 'fab',     label: 'COMMITS',   scale: 0.62, stage: 1 },
+    { kind: 'hab',     label: 'CALENDAR',  scale: 0.54, stage: 1 },
+    { kind: 'rig',     label: 'TASK CHURN', scale: 0.4, stage: 1 },
+    { kind: 'dome',    label: 'TRAINING',  scale: 0.38, stage: 1 },
+    { kind: 'mast',    label: 'NOTES',     scale: 0.3, stage: 1 }
+  ],
+  events: [
+    { t: 0.06, kind: 'build',      magnitude: 0.5 },
+    { t: 0.13, kind: 'haul',       magnitude: 0.4 },
+    { t: 0.21, kind: 'gather',     magnitude: 0.6 },
+    { t: 0.28, kind: 'build',      magnitude: 0.7 },
+    { t: 0.34, kind: 'expedition', magnitude: 0.5 },
+    { t: 0.42, kind: 'survey',     magnitude: 0.4 },
+    { t: 0.49, kind: 'build',      magnitude: 0.45 },
+    { t: 0.55, kind: 'gather',     magnitude: 0.5 },
+    { t: 0.63, kind: 'haul',       magnitude: 0.6 },
+    { t: 0.70, kind: 'incursion',  magnitude: 0.4 },
+    { t: 0.78, kind: 'build',      magnitude: 0.55 },
+    { t: 0.85, kind: 'expedition', magnitude: 0.45 },
+    { t: 0.92, kind: 'gather',     magnitude: 0.5 }
+  ],
+  metrics: { uptimePct: 1 }
+};
+
+/* -------------------------------------------------------------------- config */
+const CFG = {
+  loopSec: 150,          // one colony day
+  fps: 20,
+  dprMax: 1.5,
+  horizon: 0.5,          // horizon height as a fraction of the frame
+  camH: 30,              // camera height, metres
+  nearZ: 14,             // depth that lands on the bottom edge
+  maxColonists: 56,
+  maxVehicles: 10,
+  maxInstances: 2200,
+  maxFx: 120
+};
+
+/* ----------------------------------------------------------------- utilities */
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = t => t * t * (3 - 2 * t);
+const TAU = Math.PI * 2;
+
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+/* mulberry32 — the only randomness in the file. No Math.random anywhere, so a
+ * given week renders identically every time it is opened. */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const num = (v, def, lo, hi) =>
+  (typeof v === 'number' && isFinite(v)) ? clamp(v, lo, hi) : def;
+const str = (v, def, allowed) =>
+  (typeof v === 'string' && (!allowed || allowed.indexOf(v) >= 0)) ? v : def;
+
+function hsl(h, s, l, a) {
+  return a === undefined ? `hsl(${h} ${s}% ${l}%)` : `hsla(${h} ${s}% ${l}% / ${a})`;
+}
+/* HSL -> 0..1 RGB, for the GL path's tints and the lighting passes. */
+function hsl2rgb(h, s, l) {
+  h = ((h % 360) + 360) % 360 / 360; s /= 100; l /= 100;
+  if (s === 0) return [l, l, l];
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const f = t => {
+    t = (t + 1) % 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  return [f(h + 1 / 3), f(h), f(h - 1 / 3)];
+}
+
+/* ------------------------------------------------------------- read the data */
+function readData() {
+  let raw = null;
+  try { raw = window.ROB64_COLONY; } catch (e) { raw = null; }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = SAMPLE;
+
+  const d = {};
+  d.generated = typeof raw.generated === 'string' ? raw.generated : 'rob64';
+  const p = (raw.planet && typeof raw.planet === 'object') ? raw.planet : {};
+  const c = (raw.colony && typeof raw.colony === 'object') ? raw.colony : {};
+  const m = (raw.metrics && typeof raw.metrics === 'object') ? raw.metrics : {};
+
+  /* The seed is the week start, so staging holds all week while the data under
+   * it moves — same rule as Fleet Action. */
+  const seed = fnv1a('landfall|' + d.generated);
+  const srnd = mulberry32(seed);
+  const pal = seedPlanet(srnd);
+
+  /* Planet: explicit when the emitter named it, otherwise drawn from the seed.
+   * Either way a new week is a new world. */
+  d.seed = seed;
+  d.planet = {
+    skyHue:    num(p.skyHue,    pal.skyHue, 0, 360),
+    groundHue: num(p.groundHue, pal.groundHue, 0, 360),
+    rockHue:   num(p.rockHue,   pal.rockHue, 0, 360),
+    vegHue:    num(p.vegHue,    pal.vegHue, 0, 360),
+    terrain:   str(p.terrain, ['dunes', 'ridges', 'craters', 'flats'][Math.floor(srnd() * 4)],
+                   ['dunes', 'ridges', 'craters', 'flats']),
+    moons:     Math.round(num(p.moons, Math.floor(srnd() * 3), 0, 3)),
+    ring:      typeof p.ring === 'boolean' ? p.ring : srnd() < 0.35,
+    weather:   str(p.weather, ['clear', 'dust', 'spores'][Math.floor(srnd() * 3)],
+                   ['clear', 'dust', 'spores'])
+  };
+
+  d.colony = {
+    extent:    num(c.extent,    0.5, 0, 1),
+    bustle:    num(c.bustle,    0.5, 0, 1),
+    industry:  num(c.industry,  0.5, 0, 1),
+    community: num(c.community, 0.5, 0, 1),
+    terraform: num(c.terraform, 0.4, 0, 1)
+  };
+  d.temper = num(raw.temper, 0, -1, 1);
+  d.uptime = num(m.uptimePct, 1, 0, 1);
+
+  const KINDS = ['lander', 'hab', 'dome', 'fab', 'rig', 'mast', 'depot', 'tower', 'solar'];
+  d.structures = [];
+  if (Array.isArray(raw.structures)) {
+    for (const s of raw.structures) {
+      if (!s || typeof s !== 'object') continue;
+      d.structures.push({
+        kind: str(s.kind, 'hab', KINDS),
+        label: typeof s.label === 'string' ? s.label.slice(0, 14) : '',
+        scale: num(s.scale, 0.5, 0.05, 1),
+        stage: Math.round(num(s.stage, 1, 0, 1))
+      });
+      if (d.structures.length >= 10) break;
+    }
+  }
+  if (!d.structures.length || d.structures[0].kind !== 'lander') {
+    d.structures.unshift({ kind: 'lander', label: 'LANDFALL', scale: 0.85, stage: 1 });
+  }
+
+  const EKINDS = ['build', 'haul', 'gather', 'expedition', 'survey', 'incursion'];
+  d.events = [];
+  if (Array.isArray(raw.events)) {
+    for (const e of raw.events) {
+      if (!e || typeof e !== 'object') continue;
+      const kind = str(e.kind, null, EKINDS);
+      if (!kind) continue;
+      d.events.push({ t: num(e.t, 0, 0, 1), kind,
+                      magnitude: num(e.magnitude, 0.5, 0.1, 1) });
+      if (d.events.length >= 96) break;
+    }
+  }
+  d.events.sort((a, b) => a.t - b.t);
+  return d;
+}
+
+/* Planet themes. Free hues gave a teal plain under a magenta sky, and
+ * hue-offset rules gave a green sky over a purple plain: technically a new
+ * world every week, but not one worth looking at every day. Eight curated
+ * sky/ground pairings with a little jitter keep the weekly surprise and stay
+ * habitable. The same table lives in scripts/fleet-data.py — they must agree
+ * or a `?seed=` preview will not match what the emitter writes. */
+const PLANET_THEMES = [
+  [205, 24, 118],   // blue sky over rust desert — the familiar one
+  [222, 40, 104],   // pale sky, sand
+  [268, 28, 134],   // violet dusk, rust
+  [20, 202, 96],    // amber sky, slate plains
+  [190, 82, 128],   // teal sky, olive ground
+  [240, 12, 150],   // deep indigo, red ground
+  [332, 264, 112],  // rose sky, violet-grey ground
+  [168, 38, 142]    // seafoam sky, sand
+];
+function seedPlanet(r) {
+  const th = PLANET_THEMES[Math.floor(r() * PLANET_THEMES.length)];
+  const jit = (n) => Math.round((n + (r() - 0.5) * 14 + 360) % 360);
+  const groundHue = jit(th[1]);
+  return { skyHue: jit(th[0]), groundHue,
+           rockHue: Math.round((groundHue + 350 + r() * 20) % 360),
+           vegHue: jit(th[2]) };
+}
+
+/* -------------------------------------------------------------- the palette
+ * Everything is baked in the week's colours, so the per-frame work carries no
+ * per-sprite tint: the only live colour work is one multiply pass for the time
+ * of day and one additive pass for lights. Cheap on both paths. */
+function buildPalette(d) {
+  const P = d.planet;
+  const warm = (P.skyHue + 30) % 360;
+  return {
+    sky:      { h: P.skyHue, s: 42, l: 62 },
+    skyHigh:  { h: (P.skyHue + 12) % 360, s: 48, l: 34 },
+    haze:     { h: warm, s: 52, l: 74 },
+    ground:   { h: P.groundHue, s: 32, l: 42 },
+    groundFar:{ h: P.groundHue, s: 24, l: 51 },
+    rock:     { h: P.rockHue, s: 28, l: 38 },
+    rockLit:  { h: P.rockHue, s: 30, l: 58 },
+    veg:      { h: P.vegHue, s: 44, l: 42 },
+    vegLit:   { h: P.vegHue, s: 50, l: 58 },
+    water:    { h: 192 + ((P.skyHue % 30) | 0), s: 44, l: 54 },
+    metal:    { h: (P.skyHue + 180) % 360, s: 10, h2: 0, s2: 0, l: 76 },
+    suit:     { h: 36, s: 72, l: 66 },
+    suitAlt:  { h: (P.vegHue + 30) % 360, s: 54, l: 62 },
+    accent:   { h: (P.skyHue + 200) % 360, s: 62, l: 58 },
+    lamp:     { h: 42, s: 92, l: 72 }
+  };
+}
+
+/* ===========================================================================
+ *  ATLAS — every sprite is drawn procedurally once, at boot, into one canvas.
+ *  No external assets. Structures bake twice: an albedo sheet and an emissive
+ *  "lit" sheet holding only the windows, which the additive pass fades up at
+ *  night. Both render paths read the same atlas, so they cannot disagree.
+ * ======================================================================== */
+
+const ATLAS_SIZE = 2048;
+
+function makeAtlas(PAL, rnd) {
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = ATLAS_SIZE;
+  const g = cv.getContext('2d');
+  const sprites = {};
+  let shelfX = 2, shelfY = 2, shelfH = 0;
+
+  /* name, bake width/height in px, world width in metres, anchor (0..1 of the
+   * sprite's height; 1 = stands on the ground), draw(ctx, w, h, mode). */
+  function bake(name, w, h, metres, anchorY, draw, mode) {
+    w = Math.ceil(w); h = Math.ceil(h);
+    if (shelfX + w + 2 > ATLAS_SIZE) { shelfX = 2; shelfY += shelfH + 2; shelfH = 0; }
+    if (shelfY + h + 2 > ATLAS_SIZE) return (sprites[name] = sprites.puff || null);
+    const x = shelfX, y = shelfY;
+    shelfX += w + 2; shelfH = Math.max(shelfH, h);
+    g.save();
+    g.translate(x, y);
+    g.beginPath(); g.rect(0, 0, w, h); g.clip();
+    draw(g, w, h, mode || 'base');
+    g.restore();
+    sprites[name] = { x, y, w, h, metres, anchorY, aspect: h / w };
+    return sprites[name];
+  }
+  /* A structure: albedo plus an emissive window sheet of identical geometry. */
+  function bakePair(name, w, h, metres, anchorY, draw) {
+    bake(name, w, h, metres, anchorY, draw, 'base');
+    bake(name + '_lit', w, h, metres, anchorY, draw, 'lit');
+  }
+
+  const C = PAL;
+  const col = (c, dl, a) => hsl(c.h, c.s, clamp(c.l + (dl || 0), 2, 97), a);
+
+  /* ---------------------------------------------------------------- helpers */
+  function roundRect(g, x, y, w, h, r) {
+    r = Math.min(r, w / 2, h / 2);
+    g.beginPath();
+    g.moveTo(x + r, y);
+    g.arcTo(x + w, y, x + w, y + h, r);
+    g.arcTo(x + w, y + h, x, y + h, r);
+    g.arcTo(x, y + h, x, y, r);
+    g.arcTo(x, y, x + w, y, r);
+    g.closePath();
+  }
+  /* Key light comes from the upper left in every sprite, matching the sky's
+   * baked sun side, so the scene reads as one lighting setup. */
+  function litFill(g, x, y, w, h, c, up, down) {
+    const grad = g.createLinearGradient(x, y, x + w * 0.45, y + h);
+    grad.addColorStop(0, col(c, up));
+    grad.addColorStop(1, col(c, down));
+    g.fillStyle = grad;
+  }
+  function panelLine(g, x0, y0, x1, y1, a) {
+    g.strokeStyle = `rgba(0,0,0,${a || 0.18})`;
+    g.lineWidth = Math.max(1, (x1 - x0 + y1 - y0) * 0.012);
+    g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+  }
+  function windows(g, mode, cells) {
+    for (const [x, y, w, h, r] of cells) {
+      if (mode === 'lit') {
+        g.fillStyle = col(C.lamp, 4);
+        roundRect(g, x, y, w, h, r === undefined ? Math.min(w, h) * 0.3 : r);
+        g.fill();
+        g.globalAlpha = 0.16;
+        g.filter = 'blur(2px)';
+        roundRect(g, x - w * 0.14, y - h * 0.14, w * 1.28, h * 1.28, w * 0.4);
+        g.fill();
+        g.filter = 'none';
+        g.globalAlpha = 1;
+      } else {
+        // Unlit glass: cool and dark, so daytime hulls read as structures and
+        // the warm window light at night is a change rather than a constant.
+        g.fillStyle = `hsl(${(C.sky.h + 8) % 360} 24% 26% / 0.92)`;
+        roundRect(g, x, y, w, h, r === undefined ? Math.min(w, h) * 0.3 : r);
+        g.fill();
+        g.strokeStyle = col(C.metal, -34, 0.6);
+        g.lineWidth = Math.max(1, h * 0.07);
+        g.stroke();
+      }
+    }
+  }
+  /* Everything that is not an emissive window vanishes on the lit sheet. */
+  const shell = mode => mode !== 'lit';
+
+  /* ------------------------------------------------------------- the lander
+   * The first thing that happened: a capsule on legs, scorched a little,
+   * ladder down, flag planted. It never moves and never changes. */
+  bakePair('lander', 230, 280, 14, 0.94, (g, w, h, mode) => {
+    const cx = w * 0.5;
+    if (shell(mode)) {
+      // legs
+      g.strokeStyle = col(C.metal, -40);
+      g.lineWidth = w * 0.035;
+      g.lineCap = 'round';
+      for (const dx of [-1, 1]) {
+        g.beginPath();
+        g.moveTo(cx + dx * w * 0.16, h * 0.70);
+        g.lineTo(cx + dx * w * 0.38, h * 0.96);
+        g.stroke();
+        g.beginPath();
+        g.moveTo(cx + dx * w * 0.30, h * 0.955);
+        g.lineTo(cx + dx * w * 0.44, h * 0.955);
+        g.stroke();
+      }
+      // body
+      litFill(g, cx - w * 0.26, h * 0.26, w * 0.52, h * 0.5, C.metal, 10, -22);
+      roundRect(g, cx - w * 0.26, h * 0.26, w * 0.52, h * 0.5, w * 0.08);
+      g.fill();
+      // nose cone
+      g.beginPath();
+      g.moveTo(cx, h * 0.06);
+      g.lineTo(cx + w * 0.26, h * 0.30);
+      g.lineTo(cx - w * 0.26, h * 0.30);
+      g.closePath();
+      litFill(g, cx - w * 0.26, h * 0.06, w * 0.52, h * 0.24, C.accent, 8, -20);
+      g.fill();
+      // engine bell
+      g.fillStyle = col(C.metal, -46);
+      g.beginPath();
+      g.moveTo(cx - w * 0.13, h * 0.74);
+      g.lineTo(cx + w * 0.13, h * 0.74);
+      g.lineTo(cx + w * 0.09, h * 0.84);
+      g.lineTo(cx - w * 0.09, h * 0.84);
+      g.closePath();
+      g.fill();
+      // ladder
+      g.strokeStyle = col(C.metal, -30);
+      g.lineWidth = w * 0.014;
+      for (let i = 0; i < 5; i++) {
+        const y = h * (0.56 + i * 0.075);
+        g.beginPath(); g.moveTo(cx + w * 0.26, y); g.lineTo(cx + w * 0.34, y); g.stroke();
+      }
+      g.beginPath();
+      g.moveTo(cx + w * 0.30, h * 0.52); g.lineTo(cx + w * 0.30, h * 0.94);
+      g.stroke();
+      panelLine(g, cx - w * 0.26, h * 0.46, cx + w * 0.26, h * 0.46, 0.14);
+      panelLine(g, cx - w * 0.26, h * 0.62, cx + w * 0.26, h * 0.62, 0.14);
+    }
+    windows(g, mode, [
+      [cx - w * 0.14, h * 0.34, w * 0.12, h * 0.07],
+      [cx + w * 0.03, h * 0.34, w * 0.12, h * 0.07],
+      [cx - w * 0.07, h * 0.66, w * 0.15, h * 0.09]
+    ]);
+  });
+
+  /* -------------------------------------------------------- habs and domes */
+  bakePair('hab', 220, 150, 11, 0.95, (g, w, h, mode) => {
+    const cx = w * 0.5, base = h * 0.92;
+    if (shell(mode)) {
+      g.beginPath();
+      g.moveTo(w * 0.06, base);
+      g.lineTo(w * 0.06, h * 0.52);
+      g.bezierCurveTo(w * 0.06, h * 0.12, w * 0.94, h * 0.12, w * 0.94, h * 0.52);
+      g.lineTo(w * 0.94, base);
+      g.closePath();
+      litFill(g, 0, h * 0.1, w, h, C.metal, 12, -26);
+      g.fill();
+      g.fillStyle = 'rgba(255,255,255,0.10)';
+      g.beginPath();
+      g.moveTo(w * 0.06, h * 0.52);
+      g.bezierCurveTo(w * 0.06, h * 0.12, w * 0.5, h * 0.12, w * 0.5, h * 0.14);
+      g.lineTo(w * 0.34, base); g.lineTo(w * 0.06, base);
+      g.closePath(); g.fill();
+      // skirt + door
+      g.fillStyle = col(C.metal, -34);
+      g.fillRect(w * 0.06, base - h * 0.05, w * 0.88, h * 0.05);
+      g.fillStyle = col(C.metal, -40);
+      roundRect(g, cx - w * 0.07, base - h * 0.26, w * 0.14, h * 0.26, w * 0.02);
+      g.fill();
+      for (let i = 1; i < 4; i++) panelLine(g, w * (0.06 + i * 0.22), h * 0.2, w * (0.06 + i * 0.22), base, 0.1);
+    }
+    windows(g, mode, [
+      [w * 0.14, h * 0.44, w * 0.12, h * 0.14],
+      [w * 0.74, h * 0.44, w * 0.12, h * 0.14],
+      [cx - w * 0.05, base - h * 0.20, w * 0.10, h * 0.10]
+    ]);
+  });
+
+  /* Greenhouse: the cheerful one. Translucent arch, rows of green inside. */
+  bakePair('dome', 200, 130, 10, 0.95, (g, w, h, mode) => {
+    const base = h * 0.9;
+    if (shell(mode)) {
+      g.beginPath();
+      g.moveTo(w * 0.05, base);
+      g.quadraticCurveTo(w * 0.5, -h * 0.18, w * 0.95, base);
+      g.closePath();
+      const grad = g.createLinearGradient(0, h * 0.1, w * 0.4, base);
+      grad.addColorStop(0, col(C.vegLit, 16, 0.55));
+      grad.addColorStop(1, col(C.veg, -6, 0.75));
+      g.fillStyle = grad;
+      g.fill();
+      // planting rows
+      g.fillStyle = col(C.veg, -10);
+      for (let i = 0; i < 3; i++) {
+        const y = base - h * (0.08 + i * 0.12);
+        const half = w * (0.42 - i * 0.09);
+        g.beginPath();
+        g.ellipse(w * 0.5, y, half, h * 0.035, 0, 0, TAU);
+        g.fill();
+      }
+      // frame ribs
+      g.strokeStyle = col(C.metal, -22, 0.8);
+      g.lineWidth = w * 0.012;
+      for (const f of [0.22, 0.5, 0.78]) {
+        g.beginPath();
+        g.moveTo(w * f, base);
+        g.quadraticCurveTo(w * f, h * (0.06 + Math.abs(f - 0.5) * 0.5), w * 0.5, h * (0.04 + Math.abs(f - 0.5)));
+        g.stroke();
+      }
+      g.strokeStyle = col(C.metal, -10, 0.9);
+      g.lineWidth = w * 0.018;
+      g.beginPath();
+      g.moveTo(w * 0.05, base);
+      g.quadraticCurveTo(w * 0.5, -h * 0.18, w * 0.95, base);
+      g.stroke();
+      g.fillStyle = col(C.metal, -34);
+      g.fillRect(w * 0.05, base - h * 0.03, w * 0.9, h * 0.05);
+    }
+    windows(g, mode, [[w * 0.3, base - h * 0.34, w * 0.4, h * 0.22, h * 0.1]]);
+  });
+
+  /* Fabricator: where things get made. Gantry, chimney, open bay. */
+  bakePair('fab', 220, 160, 12, 0.95, (g, w, h, mode) => {
+    const base = h * 0.93;
+    if (shell(mode)) {
+      litFill(g, 0, h * 0.3, w, h, C.metal, 6, -30);
+      roundRect(g, w * 0.08, h * 0.38, w * 0.66, base - h * 0.38, w * 0.02);
+      g.fill();
+      // sawtooth roof
+      g.fillStyle = col(C.metal, 14);
+      g.beginPath();
+      for (let i = 0; i < 3; i++) {
+        const x = w * (0.08 + i * 0.22);
+        g.moveTo(x, h * 0.38);
+        g.lineTo(x + w * 0.11, h * 0.26);
+        g.lineTo(x + w * 0.22, h * 0.38);
+      }
+      g.fill();
+      // chimney + gantry
+      g.fillStyle = col(C.metal, -24);
+      g.fillRect(w * 0.60, h * 0.14, w * 0.07, h * 0.3);
+      g.fillStyle = col(C.accent, -6);
+      g.fillRect(w * 0.59, h * 0.11, w * 0.09, h * 0.04);
+      g.strokeStyle = col(C.accent, -4);
+      g.lineWidth = w * 0.025;
+      g.beginPath();
+      g.moveTo(w * 0.78, base); g.lineTo(w * 0.78, h * 0.22); g.lineTo(w * 0.96, h * 0.22);
+      g.stroke();
+      g.lineWidth = w * 0.012;
+      g.beginPath(); g.moveTo(w * 0.93, h * 0.22); g.lineTo(w * 0.93, h * 0.44); g.stroke();
+      g.fillStyle = col(C.accent, -14);
+      roundRect(g, w * 0.89, h * 0.44, w * 0.08, h * 0.07, w * 0.01); g.fill();
+      // open bay
+      g.fillStyle = col(C.metal, -46);
+      roundRect(g, w * 0.14, base - h * 0.22, w * 0.2, h * 0.22, w * 0.01); g.fill();
+      for (let i = 1; i < 3; i++) panelLine(g, w * (0.08 + i * 0.22), h * 0.4, w * (0.08 + i * 0.22), base, 0.12);
+    }
+    windows(g, mode, [
+      [w * 0.40, h * 0.48, w * 0.3, h * 0.10],
+      [w * 0.17, base - h * 0.19, w * 0.14, h * 0.16],
+      [w * 0.40, h * 0.66, w * 0.1, h * 0.08]
+    ]);
+  });
+
+  /* Terraform rig: tall, with a vapour ring. The thing pushing green outward. */
+  bakePair('rig', 130, 250, 7, 0.96, (g, w, h, mode) => {
+    const cx = w * 0.5;
+    if (shell(mode)) {
+      g.strokeStyle = col(C.metal, -26);
+      g.lineWidth = w * 0.05;
+      g.beginPath();
+      g.moveTo(cx - w * 0.22, h * 0.95); g.lineTo(cx - w * 0.07, h * 0.22);
+      g.lineTo(cx + w * 0.07, h * 0.22); g.lineTo(cx + w * 0.22, h * 0.95);
+      g.stroke();
+      g.lineWidth = w * 0.03;
+      for (let i = 0; i < 5; i++) {
+        const t = i / 4, y = h * (0.26 + t * 0.66);
+        const sp = w * (0.08 + t * 0.14);
+        g.beginPath(); g.moveTo(cx - sp, y); g.lineTo(cx + sp, y); g.stroke();
+      }
+      // head + nozzle ring
+      litFill(g, cx - w * 0.3, h * 0.04, w * 0.6, h * 0.2, C.accent, 10, -18);
+      roundRect(g, cx - w * 0.28, h * 0.06, w * 0.56, h * 0.16, w * 0.06);
+      g.fill();
+      g.strokeStyle = col(C.vegLit, 6, 0.85);
+      g.lineWidth = w * 0.06;
+      g.beginPath(); g.ellipse(cx, h * 0.26, w * 0.34, h * 0.035, 0, 0, TAU); g.stroke();
+      g.fillStyle = col(C.metal, -36);
+      roundRect(g, cx - w * 0.3, h * 0.92, w * 0.6, h * 0.07, w * 0.02); g.fill();
+    }
+    windows(g, mode, [[cx - w * 0.17, h * 0.11, w * 0.34, h * 0.06]]);
+  });
+
+  /* Comms mast: the colony's voice. Lattice, dish, blinker at the top. */
+  bakePair('mast', 110, 240, 5, 0.97, (g, w, h, mode) => {
+    const cx = w * 0.5;
+    if (shell(mode)) {
+      g.strokeStyle = col(C.metal, -18);
+      g.lineWidth = w * 0.04;
+      g.beginPath();
+      g.moveTo(cx - w * 0.26, h * 0.97); g.lineTo(cx, h * 0.08);
+      g.lineTo(cx + w * 0.26, h * 0.97);
+      g.stroke();
+      g.lineWidth = w * 0.025;
+      for (let i = 0; i < 7; i++) {
+        const t = i / 6, y = h * (0.14 + t * 0.8);
+        const sp = w * 0.26 * t + w * 0.02;
+        g.beginPath(); g.moveTo(cx - sp, y); g.lineTo(cx + sp, y * 1.0); g.stroke();
+        g.beginPath();
+        g.moveTo(cx - sp, y); g.lineTo(cx + sp * 0.7, y - h * 0.09); g.stroke();
+      }
+      g.fillStyle = col(C.metal, 8);
+      g.beginPath(); g.ellipse(cx + w * 0.16, h * 0.26, w * 0.2, h * 0.06, -0.5, 0, TAU); g.fill();
+      g.fillStyle = col(C.metal, -40);
+      g.fillRect(cx - w * 0.3, h * 0.95, w * 0.6, h * 0.045);
+    }
+    windows(g, mode, [[cx - w * 0.05, h * 0.05, w * 0.1, h * 0.035, w * 0.05]]);
+  });
+
+  /* Depot: stacked crates under a canopy. Where the haulers go. */
+  bakePair('depot', 190, 110, 10, 0.94, (g, w, h, mode) => {
+    const base = h * 0.92;
+    if (shell(mode)) {
+      g.strokeStyle = col(C.metal, -28);
+      g.lineWidth = w * 0.02;
+      for (const dx of [0.1, 0.88]) {
+        g.beginPath(); g.moveTo(w * dx, base); g.lineTo(w * dx, h * 0.34); g.stroke();
+      }
+      g.fillStyle = col(C.accent, -2);
+      g.beginPath();
+      g.moveTo(w * 0.04, h * 0.34); g.lineTo(w * 0.96, h * 0.34);
+      g.lineTo(w * 0.9, h * 0.26); g.lineTo(w * 0.1, h * 0.26);
+      g.closePath(); g.fill();
+      const crates = [[0.16, 0.34, 0.2], [0.40, 0.30, 0.26], [0.68, 0.26, 0.22], [0.26, 0.22, 0.16]];
+      for (const [x, cw, ch] of crates) {
+        litFill(g, w * x, base - h * ch, w * cw, h * ch, C.metal, 4, -24);
+        roundRect(g, w * x, base - h * ch, w * cw, h * ch, w * 0.012);
+        g.fill();
+        panelLine(g, w * x, base - h * ch * 0.5, w * (x + cw), base - h * ch * 0.5, 0.14);
+      }
+      g.fillStyle = col(C.ground, -16);
+      g.fillRect(w * 0.04, base, w * 0.92, h * 0.05);
+    }
+    windows(g, mode, [[w * 0.45, base - h * 0.2, w * 0.1, h * 0.07]]);
+  });
+
+  /* Tower: what a dense week grows into. Town stage, not a scoreboard. */
+  bakePair('tower', 150, 250, 8, 0.96, (g, w, h, mode) => {
+    if (shell(mode)) {
+      litFill(g, 0, h * 0.1, w, h, C.metal, 10, -28);
+      roundRect(g, w * 0.16, h * 0.14, w * 0.68, h * 0.82, w * 0.05);
+      g.fill();
+      g.fillStyle = col(C.accent, -4);
+      roundRect(g, w * 0.1, h * 0.08, w * 0.8, h * 0.08, w * 0.03); g.fill();
+      g.fillStyle = col(C.metal, -34);
+      g.fillRect(w * 0.1, h * 0.94, w * 0.8, h * 0.05);
+      for (let i = 1; i < 5; i++) panelLine(g, w * 0.16, h * (0.2 + i * 0.16), w * 0.84, h * (0.2 + i * 0.16), 0.1);
+    }
+    const cells = [];
+    for (let r = 0; r < 5; r++) {
+      for (let c = 0; c < 3; c++) {
+        cells.push([w * (0.24 + c * 0.2), h * (0.22 + r * 0.16), w * 0.12, h * 0.08]);
+      }
+    }
+    windows(g, mode, cells);
+  });
+
+  /* Solar array: angled rows, catching the week's light. */
+  bakePair('solar', 190, 90, 11, 0.9, (g, w, h, mode) => {
+    if (shell(mode)) {
+      for (let i = 0; i < 3; i++) {
+        const x = w * (0.06 + i * 0.31), y = h * (0.42 + i * 0.12);
+        g.save();
+        g.translate(x, y);
+        g.transform(1, 0, -0.5, 1, 0, 0);
+        const grad = g.createLinearGradient(0, 0, w * 0.26, h * 0.3);
+        grad.addColorStop(0, col(C.accent, 18, 0.95));
+        grad.addColorStop(1, col(C.accent, -22, 0.95));
+        g.fillStyle = grad;
+        g.fillRect(0, 0, w * 0.26, h * 0.3);
+        g.strokeStyle = 'rgba(0,0,0,0.25)';
+        g.lineWidth = 1.2;
+        for (let k = 1; k < 3; k++) {
+          g.beginPath();
+          g.moveTo(w * 0.26 * k / 3, 0); g.lineTo(w * 0.26 * k / 3, h * 0.3); g.stroke();
+        }
+        g.restore();
+        g.fillStyle = col(C.metal, -34);
+        g.fillRect(x + w * 0.05, y + h * 0.28, w * 0.03, h * 0.2);
+      }
+    }
+  });
+
+  /* Foundation pad: a claim staked at the frontier. No building yet, and no
+   * implication that one is owed — this is what reaching outward looks like. */
+  bakePair('pad', 180, 70, 10, 0.78, (g, w, h, mode) => {
+    if (shell(mode)) {
+      g.strokeStyle = col(C.metal, -10, 0.85);
+      g.lineWidth = h * 0.07;
+      g.setLineDash([w * 0.07, w * 0.05]);
+      g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.44, h * 0.3, 0, 0, TAU); g.stroke();
+      g.setLineDash([]);
+      g.fillStyle = col(C.ground, 8, 0.6);
+      g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.4, h * 0.26, 0, 0, TAU); g.fill();
+      for (const dx of [-0.34, 0.34]) {
+        g.fillStyle = col(C.accent, 4);
+        g.fillRect(w * (0.5 + dx), h * 0.2, w * 0.02, h * 0.42);
+        g.beginPath();
+        g.moveTo(w * (0.5 + dx) + w * 0.02, h * 0.2);
+        g.lineTo(w * (0.5 + dx) + w * 0.1, h * 0.26);
+        g.lineTo(w * (0.5 + dx) + w * 0.02, h * 0.32);
+        g.closePath(); g.fill();
+      }
+    }
+  });
+
+  /* Scaffold, two stages: a frame goes up, then the shell closes over it. */
+  for (const st of [1, 2]) {
+    bakePair('scaffold' + st, 200, 150, 11, 0.95, (g, w, h, mode) => {
+      const base = h * 0.93;
+      if (shell(mode)) {
+        if (st === 2) {
+          g.beginPath();
+          g.moveTo(w * 0.12, base);
+          g.quadraticCurveTo(w * 0.5, h * 0.18, w * 0.88, base);
+          g.closePath();
+          litFill(g, 0, h * 0.2, w, h, C.metal, 8, -26);
+          g.fill();
+          g.fillStyle = col(C.metal, -30, 0.5);
+          g.beginPath();
+          g.moveTo(w * 0.5, h * 0.26); g.lineTo(w * 0.88, base); g.lineTo(w * 0.5, base);
+          g.closePath(); g.fill();
+        }
+        g.strokeStyle = col(C.accent, 2, 0.95);
+        g.lineWidth = w * 0.018;
+        for (const fx of [0.1, 0.32, 0.68, 0.9]) {
+          g.beginPath(); g.moveTo(w * fx, base); g.lineTo(w * fx, h * 0.3); g.stroke();
+        }
+        for (const fy of [0.3, 0.52, 0.74]) {
+          g.beginPath(); g.moveTo(w * 0.1, h * fy); g.lineTo(w * 0.9, h * fy); g.stroke();
+        }
+        g.lineWidth = w * 0.01;
+        g.beginPath(); g.moveTo(w * 0.1, h * 0.74); g.lineTo(w * 0.32, h * 0.52); g.stroke();
+        g.beginPath(); g.moveTo(w * 0.68, h * 0.52); g.lineTo(w * 0.9, h * 0.74); g.stroke();
+        g.fillStyle = col(C.ground, -14);
+        g.fillRect(w * 0.08, base, w * 0.84, h * 0.05);
+      }
+      if (st === 2) windows(g, mode, [[w * 0.42, base - h * 0.2, w * 0.16, h * 0.12]]);
+    });
+  }
+
+  /* Plaza: a paved circle with a flagpole. Where people gather. */
+  bakePair('plaza', 240, 90, 16, 0.72, (g, w, h, mode) => {
+    if (shell(mode)) {
+      g.fillStyle = col(C.ground, 12);
+      g.beginPath(); g.ellipse(w * 0.5, h * 0.7, w * 0.46, h * 0.26, 0, 0, TAU); g.fill();
+      g.strokeStyle = col(C.ground, 22, 0.8);
+      g.lineWidth = h * 0.04;
+      g.beginPath(); g.ellipse(w * 0.5, h * 0.7, w * 0.33, h * 0.19, 0, 0, TAU); g.stroke();
+      g.beginPath(); g.ellipse(w * 0.5, h * 0.7, w * 0.44, h * 0.25, 0, 0, TAU); g.stroke();
+      g.fillStyle = col(C.metal, -24);
+      g.fillRect(w * 0.49, h * 0.12, w * 0.015, h * 0.6);
+      g.fillStyle = col(C.accent, 10);
+      g.beginPath();
+      g.moveTo(w * 0.505, h * 0.14); g.lineTo(w * 0.60, h * 0.2);
+      g.lineTo(w * 0.505, h * 0.27); g.closePath(); g.fill();
+      for (let i = 0; i < 4; i++) {
+        g.fillStyle = col(C.metal, -16);
+        const a = i / 4 * TAU + 0.6;
+        roundRect(g, w * (0.5 + Math.cos(a) * 0.3) - w * 0.03, h * (0.7 + Math.sin(a) * 0.17), w * 0.06, h * 0.05, w * 0.02);
+        g.fill();
+      }
+    }
+    windows(g, mode, [[w * 0.485, h * 0.1, w * 0.03, h * 0.03, w * 0.02]]);
+  });
+
+  /* ------------------------------------------------------------- the people
+   * Round helmets, big visors, stubby limbs. Endearing on purpose: the mood is
+   * optimistic and industrious, which is a mood and not a verdict. */
+  function colonist(suit) {
+    return (g, w, h, phase) => {
+      const cx = w * 0.5, legY = h * 0.68, swing = phase;
+      g.lineCap = 'round';
+      // legs
+      g.strokeStyle = col(suit, -26);
+      g.lineWidth = w * 0.14;
+      for (const s of [-1, 1]) {
+        g.beginPath();
+        g.moveTo(cx, legY);
+        g.lineTo(cx + s * w * 0.1 + swing * s * w * 0.16, h * 0.97);
+        g.stroke();
+      }
+      // boots
+      g.strokeStyle = col(suit, -40);
+      g.lineWidth = w * 0.12;
+      for (const s of [-1, 1]) {
+        g.beginPath();
+        g.moveTo(cx + s * w * 0.1 + swing * s * w * 0.16, h * 0.95);
+        g.lineTo(cx + s * w * 0.16 + swing * s * w * 0.16, h * 0.96);
+        g.stroke();
+      }
+      // backpack
+      g.fillStyle = col(suit, -34);
+      roundRect(g, cx - w * 0.30, h * 0.36, w * 0.18, h * 0.26, w * 0.06); g.fill();
+      // torso
+      litFill(g, cx - w * 0.2, h * 0.34, w * 0.4, h * 0.36, suit, 14, -14);
+      roundRect(g, cx - w * 0.20, h * 0.34, w * 0.40, h * 0.36, w * 0.12); g.fill();
+      // arms
+      g.strokeStyle = col(suit, -8);
+      g.lineWidth = w * 0.12;
+      for (const s of [-1, 1]) {
+        g.beginPath();
+        g.moveTo(cx + s * w * 0.18, h * 0.42);
+        g.lineTo(cx + s * w * 0.26 - swing * s * w * 0.1, h * 0.62);
+        g.stroke();
+      }
+      // helmet
+      g.fillStyle = col(suit, 20);
+      g.beginPath(); g.arc(cx, h * 0.26, w * 0.26, 0, TAU); g.fill();
+      g.fillStyle = col(C.accent, -26, 0.95);
+      g.beginPath(); g.arc(cx + w * 0.03, h * 0.27, w * 0.18, 0, TAU); g.fill();
+      g.fillStyle = 'rgba(255,255,255,0.55)';
+      g.beginPath(); g.ellipse(cx - w * 0.04, h * 0.21, w * 0.07, w * 0.045, -0.5, 0, TAU); g.fill();
+      // antenna
+      g.strokeStyle = col(suit, -30);
+      g.lineWidth = w * 0.045;
+      g.beginPath();
+      g.moveTo(cx - w * 0.2, h * 0.14); g.lineTo(cx - w * 0.26, h * 0.04);
+      g.stroke();
+      g.fillStyle = col(C.lamp, 10);
+      g.beginPath(); g.arc(cx - w * 0.26, h * 0.03, w * 0.05, 0, TAU); g.fill();
+    };
+  }
+  const walkPhases = [0, 0.85, 0, -0.85];
+  for (let i = 0; i < 4; i++) {
+    bake('crew' + i, 46, 64, 1.85, 0.99, (g, w, h) => colonist(C.suit)(g, w, h, walkPhases[i]));
+    bake('crewB' + i, 46, 64, 1.85, 0.99, (g, w, h) => colonist(C.suitAlt)(g, w, h, walkPhases[i]));
+  }
+  /* Working pose: arms up, holding something. Used at build sites. */
+  bake('crewWork', 46, 64, 1.85, 0.99, (g, w, h) => {
+    colonist(C.suit)(g, w, h, 0);
+    g.strokeStyle = col(C.suit, -8);
+    g.lineWidth = w * 0.12;
+    g.lineCap = 'round';
+    for (const s of [-1, 1]) {
+      g.beginPath();
+      g.moveTo(w * 0.5 + s * w * 0.18, h * 0.42);
+      g.lineTo(w * 0.5 + s * w * 0.3, h * 0.26);
+      g.stroke();
+    }
+  });
+  /* Waving: used when a rover rolls past, and at gatherings. */
+  bake('crewWave', 46, 64, 1.85, 0.99, (g, w, h) => {
+    colonist(C.suitAlt)(g, w, h, 0);
+    g.strokeStyle = col(C.suitAlt, -8);
+    g.lineWidth = w * 0.12;
+    g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(w * 0.68, h * 0.42); g.lineTo(w * 0.80, h * 0.18);
+    g.stroke();
+  });
+
+  /* ----------------------------------------------------------- the vehicles */
+  function wheels(g, w, h, n, r) {
+    g.fillStyle = col(C.metal, -52);
+    for (let i = 0; i < n; i++) {
+      const x = w * (0.16 + i * (0.68 / (n - 1)));
+      g.beginPath(); g.arc(x, h * 0.84, r, 0, TAU); g.fill();
+      g.fillStyle = col(C.metal, -30);
+      g.beginPath(); g.arc(x, h * 0.84, r * 0.45, 0, TAU); g.fill();
+      g.fillStyle = col(C.metal, -52);
+    }
+  }
+  bake('rover', 130, 76, 4.2, 0.96, (g, w, h) => {
+    wheels(g, w, h, 4, h * 0.13);
+    litFill(g, 0, h * 0.4, w, h * 0.5, C.accent, 14, -18);
+    roundRect(g, w * 0.08, h * 0.46, w * 0.84, h * 0.3, h * 0.08); g.fill();
+    g.fillStyle = col(C.accent, 4);
+    roundRect(g, w * 0.5, h * 0.22, w * 0.3, h * 0.26, h * 0.07); g.fill();
+    g.fillStyle = col(C.lamp, 12, 0.9);
+    roundRect(g, w * 0.55, h * 0.27, w * 0.2, h * 0.14, h * 0.05); g.fill();
+    g.strokeStyle = col(C.metal, -22);
+    g.lineWidth = w * 0.012;
+    g.beginPath(); g.moveTo(w * 0.14, h * 0.44); g.lineTo(w * 0.1, h * 0.16); g.stroke();
+    g.fillStyle = col(C.lamp, 16);
+    g.beginPath(); g.arc(w * 0.1, h * 0.14, w * 0.025, 0, TAU); g.fill();
+  });
+  bake('hauler', 170, 84, 6.4, 0.96, (g, w, h) => {
+    wheels(g, w, h, 6, h * 0.12);
+    litFill(g, 0, h * 0.3, w, h * 0.5, C.metal, 10, -24);
+    roundRect(g, w * 0.3, h * 0.3, w * 0.64, h * 0.46, h * 0.06); g.fill();
+    g.fillStyle = col(C.accent, -4);
+    roundRect(g, w * 0.06, h * 0.38, w * 0.26, h * 0.38, h * 0.07); g.fill();
+    g.fillStyle = col(C.lamp, 10, 0.85);
+    roundRect(g, w * 0.1, h * 0.44, w * 0.16, h * 0.16, h * 0.05); g.fill();
+    g.fillStyle = col(C.metal, -34);
+    for (let i = 0; i < 3; i++) g.fillRect(w * (0.36 + i * 0.2), h * 0.34, w * 0.12, h * 0.1);
+  });
+  bake('drone', 64, 44, 1.6, 0.6, (g, w, h) => {
+    g.fillStyle = col(C.metal, -40, 0.55);
+    g.fillRect(w * 0.1, h * 0.3, w * 0.8, h * 0.05);
+    litFill(g, 0, h * 0.3, w, h * 0.5, C.accent, 12, -16);
+    roundRect(g, w * 0.34, h * 0.34, w * 0.32, h * 0.3, h * 0.12); g.fill();
+    g.fillStyle = col(C.lamp, 14);
+    g.beginPath(); g.arc(w * 0.5, h * 0.62, w * 0.04, 0, TAU); g.fill();
+    for (const dx of [0.14, 0.86]) {
+      g.fillStyle = col(C.metal, -20);
+      g.beginPath(); g.ellipse(w * dx, h * 0.3, w * 0.13, h * 0.03, 0, 0, TAU); g.fill();
+    }
+  });
+
+  /* --------------------------------------------------------------- critters
+   * Local fauna. Round, three-legged, one big eye, two antennae. They turn up
+   * at the perimeter, get politely zapped, and scuttle off. Nothing is hurt,
+   * nothing is damaged, and they come back next week. */
+  for (let i = 0; i < 2; i++) {
+    bake('critter' + i, 70, 56, 1.5, 0.97, (g, w, h) => {
+      const bob = i ? -h * 0.04 : 0;
+      g.strokeStyle = col(C.water, -24);
+      g.lineWidth = w * 0.06;
+      g.lineCap = 'round';
+      for (const s of [-1, 0, 1]) {
+        g.beginPath();
+        g.moveTo(w * 0.5 + s * w * 0.12, h * 0.68 + bob);
+        g.lineTo(w * 0.5 + s * w * 0.22, h * 0.96);
+        g.stroke();
+      }
+      litFill(g, w * 0.2, h * 0.24 + bob, w * 0.6, h * 0.5, C.water, 16, -14);
+      g.beginPath(); g.ellipse(w * 0.5, h * 0.5 + bob, w * 0.3, h * 0.26, 0, 0, TAU); g.fill();
+      g.fillStyle = '#fff';
+      g.beginPath(); g.arc(w * 0.54, h * 0.46 + bob, w * 0.12, 0, TAU); g.fill();
+      g.fillStyle = '#132029';
+      g.beginPath(); g.arc(w * 0.57, h * 0.47 + bob, w * 0.06, 0, TAU); g.fill();
+      g.strokeStyle = col(C.water, -16);
+      g.lineWidth = w * 0.035;
+      for (const s of [-1, 1]) {
+        g.beginPath();
+        g.moveTo(w * 0.5 + s * w * 0.1, h * 0.28 + bob);
+        g.quadraticCurveTo(w * 0.5 + s * w * 0.24, h * 0.1 + bob, w * 0.5 + s * w * 0.14, h * 0.04 + bob);
+        g.stroke();
+      }
+      g.fillStyle = col(C.vegLit, 14);
+      for (const s of [-1, 1]) {
+        g.beginPath(); g.arc(w * 0.5 + s * w * 0.14, h * 0.04 + bob, w * 0.035, 0, TAU); g.fill();
+      }
+    });
+  }
+
+  /* --------------------------------------------------------------- terrain */
+  for (let i = 0; i < 3; i++) {
+    const rr = mulberry32(0x5EED + i);
+    bake('rock' + i, 110, 80, 2.2 + i * 1.8, 0.95, (g, w, h) => {
+      const pts = 7 + i;
+      g.beginPath();
+      for (let k = 0; k <= pts; k++) {
+        const a = Math.PI + (k / pts) * Math.PI;
+        const r = 0.34 + rr() * 0.14;
+        const x = w * (0.5 + Math.cos(a) * r);
+        const y = h * (0.92 + Math.sin(a) * r * 1.5);
+        k ? g.lineTo(x, y) : g.moveTo(x, y);
+      }
+      g.closePath();
+      litFill(g, 0, h * 0.2, w, h, C.rock, 16, -18);
+      g.fill();
+      g.fillStyle = col(C.rockLit, 6, 0.35);
+      g.beginPath();
+      g.ellipse(w * 0.38, h * 0.52, w * 0.16, h * 0.12, -0.4, 0, TAU);
+      g.fill();
+      g.fillStyle = col(C.ground, -18, 0.4);
+      g.beginPath(); g.ellipse(w * 0.52, h * 0.93, w * 0.4, h * 0.07, 0, 0, TAU); g.fill();
+    });
+  }
+  bake('crater', 220, 80, 14, 0.8, (g, w, h) => {
+    g.fillStyle = col(C.ground, -7);
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.46, h * 0.34, 0, 0, TAU); g.fill();
+    g.fillStyle = col(C.ground, 14);
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.52, w * 0.46, h * 0.3, 0, 0, TAU); g.fill();
+    g.fillStyle = col(C.ground, -13);
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.56, w * 0.34, h * 0.2, 0, 0, TAU); g.fill();
+    g.fillStyle = col(C.rock, 2, 0.45);
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.26, h * 0.14, 0, 0, TAU); g.fill();
+  });
+  /* Landforms need a soft bottom edge or the sprite rectangle reads as a cliff
+   * face sitting on the ground. Erasing a gradient out of the lower band melts
+   * them into the terrain instead. */
+  function meltBase(g, w, h, frac) {
+    const grad = g.createLinearGradient(0, h * (1 - frac), 0, h);
+    grad.addColorStop(0, 'rgba(0,0,0,0)');
+    grad.addColorStop(1, 'rgba(0,0,0,1)');
+    g.globalCompositeOperation = 'destination-out';
+    g.fillStyle = grad;
+    g.fillRect(0, h * (1 - frac), w, h * frac);
+    g.globalCompositeOperation = 'source-over';
+  }
+  bake('dune', 300, 90, 22, 0.97, (g, w, h) => {
+    g.beginPath();
+    g.moveTo(0, h * 0.95);
+    g.bezierCurveTo(w * 0.22, h * 0.3, w * 0.62, h * 0.18, w, h * 0.78);
+    g.lineTo(w, h * 0.98); g.lineTo(0, h * 0.98);
+    g.closePath();
+    litFill(g, 0, h * 0.1, w, h, C.ground, 20, 2);
+    g.fill();
+    g.strokeStyle = col(C.ground, 30, 0.45);
+    g.lineWidth = h * 0.035;
+    g.beginPath();
+    g.moveTo(w * 0.04, h * 0.9);
+    g.bezierCurveTo(w * 0.24, h * 0.33, w * 0.6, h * 0.22, w * 0.96, h * 0.8);
+    g.stroke();
+    meltBase(g, w, h, 0.52);
+  });
+  bake('dune2', 300, 80, 19, 0.97, (g, w, h) => {
+    g.beginPath();
+    g.moveTo(0, h * 0.96);
+    g.bezierCurveTo(w * 0.3, h * 0.72, w * 0.44, h * 0.22, w * 0.68, h * 0.34);
+    g.bezierCurveTo(w * 0.82, h * 0.42, w * 0.9, h * 0.74, w, h * 0.92);
+    g.lineTo(w, h * 0.99); g.lineTo(0, h * 0.99);
+    g.closePath();
+    litFill(g, 0, h * 0.1, w, h, C.ground, 17, 1);
+    g.fill();
+    g.strokeStyle = col(C.ground, 28, 0.4);
+    g.lineWidth = h * 0.03;
+    g.beginPath();
+    g.moveTo(w * 0.04, h * 0.92);
+    g.bezierCurveTo(w * 0.32, h * 0.72, w * 0.46, h * 0.26, w * 0.68, h * 0.38);
+    g.stroke();
+    meltBase(g, w, h, 0.5);
+  });
+  bake('ridge', 340, 110, 26, 0.97, (g, w, h) => {
+    const rr = mulberry32(0x21D6E);
+    g.beginPath();
+    g.moveTo(0, h);
+    let y = h * 0.7;
+    for (let x = 0; x <= w; x += w / 14) {
+      y = h * (0.34 + 0.4 * Math.abs(Math.sin(x / w * 5.2)) - 0.1 * rr());
+      g.lineTo(x, y);
+    }
+    g.lineTo(w, h); g.closePath();
+    litFill(g, 0, 0, w, h, C.rock, 24, 2);
+    g.fill();
+    g.fillStyle = col(C.rockLit, 4, 0.3);
+    g.beginPath();
+    g.moveTo(0, h);
+    for (let x = 0; x <= w; x += w / 14) {
+      g.lineTo(x, h * (0.4 + 0.4 * Math.abs(Math.sin(x / w * 5.2))));
+    }
+    g.lineTo(w, h); g.closePath(); g.fill();
+    meltBase(g, w, h, 0.44);
+  });
+  bake('moss', 140, 56, 9, 0.88, (g, w, h) => {
+    const rr = mulberry32(0x0A055);
+    for (let i = 0; i < 14; i++) {
+      g.fillStyle = col(C.veg, -6 + rr() * 18, 0.55 + rr() * 0.3);
+      const x = w * (0.1 + rr() * 0.8), y = h * (0.5 + rr() * 0.42);
+      g.beginPath(); g.ellipse(x, y, w * (0.07 + rr() * 0.08), h * (0.07 + rr() * 0.08), 0, 0, TAU); g.fill();
+    }
+  });
+  bake('plant', 54, 62, 1.3, 0.97, (g, w, h) => {
+    g.strokeStyle = col(C.veg, -10);
+    g.lineWidth = w * 0.07;
+    g.lineCap = 'round';
+    for (const s of [-1, -0.3, 0.4, 1]) {
+      g.beginPath();
+      g.moveTo(w * 0.5, h * 0.96);
+      g.quadraticCurveTo(w * (0.5 + s * 0.22), h * 0.6, w * (0.5 + s * 0.36), h * 0.22);
+      g.stroke();
+    }
+    g.fillStyle = col(C.vegLit, 8);
+    for (const s of [-1, -0.3, 0.4, 1]) {
+      g.beginPath();
+      g.ellipse(w * (0.5 + s * 0.36), h * 0.2, w * 0.1, h * 0.07, s * 0.6, 0, TAU);
+      g.fill();
+    }
+  });
+  bake('pond', 240, 80, 16, 0.78, (g, w, h) => {
+    const grad = g.createLinearGradient(0, h * 0.3, w * 0.5, h);
+    grad.addColorStop(0, col(C.water, 18, 0.92));
+    grad.addColorStop(1, col(C.water, -14, 0.92));
+    g.fillStyle = grad;
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.45, h * 0.3, 0, 0, TAU); g.fill();
+    g.strokeStyle = col(C.veg, 6, 0.7);
+    g.lineWidth = h * 0.05;
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.6, w * 0.46, h * 0.31, 0, 0, TAU); g.stroke();
+    g.fillStyle = 'rgba(255,255,255,0.35)';
+    g.beginPath(); g.ellipse(w * 0.38, h * 0.48, w * 0.12, h * 0.04, -0.1, 0, TAU); g.fill();
+  });
+  bake('road', 200, 70, 13, 0.55, (g, w, h) => {
+    g.filter = 'blur(6px)';
+    g.fillStyle = col(C.ground, 15, 0.75);
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.5, w * 0.42, h * 0.22, 0, 0, TAU); g.fill();
+    g.filter = 'blur(3px)';
+    g.fillStyle = col(C.ground, 24, 0.5);
+    g.beginPath(); g.ellipse(w * 0.5, h * 0.46, w * 0.3, h * 0.1, 0, 0, TAU); g.fill();
+    g.filter = 'none';
+  });
+
+  /* -------------------------------------------------------------------- fx */
+  function radial(g, w, h, stops) {
+    const grad = g.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.min(w, h) / 2);
+    for (const [p, c] of stops) grad.addColorStop(p, c);
+    g.fillStyle = grad;
+    g.fillRect(0, 0, w, h);
+  }
+  bake('puff', 96, 96, 3, 0.5, (g, w, h) =>
+    radial(g, w, h, [[0, 'rgba(255,255,255,0.55)'], [0.45, 'rgba(255,255,255,0.22)'], [1, 'rgba(255,255,255,0)']]));
+  bake('glow', 96, 96, 3, 0.5, (g, w, h) =>
+    radial(g, w, h, [[0, col(C.lamp, 24, 0.95)], [0.35, col(C.lamp, 8, 0.5)], [1, col(C.lamp, 0, 0)]]));
+  bake('flash', 96, 96, 3, 0.5, (g, w, h) =>
+    radial(g, w, h, [[0, 'rgba(255,255,255,0.98)'], [0.22, col(C.lamp, 18, 0.7)], [1, 'rgba(255,220,150,0)']]));
+  bake('zap', 96, 96, 3, 0.5, (g, w, h) =>
+    radial(g, w, h, [[0, 'rgba(235,255,255,0.95)'], [0.3, col(C.accent, 22, 0.55)], [1, col(C.accent, 10, 0)]]));
+  bake('vapor', 96, 96, 3, 0.5, (g, w, h) =>
+    radial(g, w, h, [[0, col(C.vegLit, 26, 0.5)], [0.4, col(C.vegLit, 10, 0.2)], [1, col(C.vegLit, 0, 0)]]));
+  bake('spark', 16, 16, 0.4, 0.5, (g, w, h) => {
+    g.fillStyle = 'rgba(255,245,220,0.95)';
+    g.beginPath(); g.arc(w / 2, h / 2, w * 0.3, 0, TAU); g.fill();
+  });
+  bake('px', 8, 8, 1, 0.5, (g, w, h) => { g.fillStyle = '#fff'; g.fillRect(0, 0, w, h); });
+  bake('shadow', 96, 48, 3, 0.5, (g, w, h) => {
+    const grad = g.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w / 2);
+    grad.addColorStop(0, 'rgba(0,0,0,0.34)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = grad;
+    g.save(); g.translate(0, h * 0.25); g.scale(1, 0.5); g.fillRect(0, 0, w, h * 1.5); g.restore();
+  });
+
+  return { canvas: cv, sprites };
+}
+
+/* ===========================================================================
+ *  VIEW — an oblique aerial projection with the horizon at mid-frame.
+ *
+ *  World coordinates are metres: x lateral, z depth away from the camera. The
+ *  camera looks slightly down from camH metres up, so the ground fills the
+ *  lower half and the sky the upper half. We are standing at the colony's near
+ *  edge looking across it, which is why the near rim is cropped by the bottom
+ *  of the frame: a scene, not a map. Depth does the scale work — a colonist is
+ *  ~22 px near the camera and ~6 px out at the frontier, and that gradient is
+ *  what makes the structures read as big.
+ * ======================================================================== */
+
+function makeView(W, H) {
+  const horizonY = Math.round(H * CFG.horizon);
+  const ground = H - horizonY;
+  // Depth that lands exactly on the bottom edge.
+  const zBottom = CFG.nearZ * 2 + 2;
+  const focal = (ground / CFG.camH) * zBottom;
+  return {
+    W, H, horizonY, ground, zBottom, focal,
+    scaleAt(z) { return focal / Math.max(z, 4); },
+    halfWidthAt(z) { return (W * 0.5) / (focal / Math.max(z, 4)); },
+    sy(z) { return horizonY + CFG.camH * (focal / Math.max(z, 4)); },
+    sx(x, z) { return W * 0.5 + x * (focal / Math.max(z, 4)); }
+  };
+}
+
+/* ===========================================================================
+ *  WORLD — deterministic layout for the week. Built once per resize.
+ *
+ *  Everything fans outward from the lander toward the horizon, so "expanding
+ *  into undeveloped parts" is literally the picture: the settled core sits low
+ *  and near, the frontier sits high and far, and raw terrain continues past it.
+ * ======================================================================== */
+
+const STRUCT_SPRITE = {
+  lander: 'lander', hab: 'hab', dome: 'dome', fab: 'fab', rig: 'rig',
+  mast: 'mast', depot: 'depot', tower: 'tower', solar: 'solar'
+};
+
+function buildWorld(d, view, atlas) {
+  const rnd = mulberry32(d.seed ^ 0x9E37);
+  const C = d.colony;
+  const T = d.temper;
+
+  /* The settled band. A quiet week is a compact homestead; a busy week reaches
+   * most of the way to the horizon. Both are complete pictures — the near end
+   * never empties out, and the far end is never an unfinished edge. */
+  const zNear = view.zBottom - 3;
+  const depthSpan = 16 + 64 * C.extent;
+  const zFar = zNear + depthSpan;
+  const place = (rho, spread, jitter) => {
+    const z = zNear + clamp(rho, 0, 3.2) * depthSpan;
+    const xf = (jitter * 2 - 1) * (0.34 + 0.66 * clamp(rho, 0, 1.2)) * spread;
+    return { x: xf * view.halfWidthAt(z) * 0.94, z };
+  };
+
+  /* ------------------------------------------------------------- structures
+   * One per named real contributor, same idea as Fleet Action's capitals: the
+   * data decides what exists and how big it is, never how healthy it looks.
+   * No structure is ever damaged, scorched or decayed in any week. */
+  const sites = [];
+  const lander = { kind: 'lander', sprite: 'lander', label: d.structures[0].label,
+                   x: -0.2 * view.halfWidthAt(zNear + 7), z: zNear + 7,
+                   scale: 1.0 + 0.35 * d.structures[0].scale, rho: 0.04 };
+  sites.push(lander);
+
+  const rest = d.structures.slice(1);
+  rest.forEach((s, i) => {
+    // Big contributors settle near the core, small ones out toward the edge.
+    const rho = 0.12 + 0.78 * (i / Math.max(1, rest.length - 1)) * (1.15 - 0.45 * s.scale);
+    const side = (i % 2 ? 1 : -1);
+    const jit = 0.5 + side * (0.18 + 0.3 * rnd());
+    const p = place(clamp(rho, 0.14, 0.95), 1, jit);
+    sites.push({ kind: s.kind, sprite: STRUCT_SPRITE[s.kind] || 'hab', label: s.label,
+                 x: p.x, z: p.z, scale: 0.68 + 0.72 * s.scale, rho });
+  });
+
+  /* Supporting structures the colony needs to look lived-in. Counts ride the
+   * two shares — industry puts up fabricators, solar and depots; community
+   * puts up habs, greenhouses and a plaza — and both sides are always present,
+   * because a mix is a description of where the week's weight fell and not a
+   * contest. */
+  const nInd = 2 + Math.round(4.5 * C.industry + 2.5 * C.extent);
+  const nCom = 2 + Math.round(4.5 * C.community + 2.5 * C.extent);
+  const indKinds = ['fab', 'solar', 'depot', 'rig', 'solar', 'depot'];
+  const comKinds = ['hab', 'dome', 'hab', 'tower', 'dome', 'hab'];
+  for (let i = 0; i < nInd; i++) {
+    const p = place(0.06 + 0.86 * rnd(), 1, rnd());
+    sites.push({ kind: 'support', sprite: indKinds[i % indKinds.length], label: '',
+                 x: p.x, z: p.z, scale: 0.66 + 0.5 * rnd() + 0.34 * C.industry, rho: 0.5 });
+  }
+  for (let i = 0; i < nCom; i++) {
+    const p = place(0.06 + 0.8 * rnd(), 1, rnd());
+    sites.push({ kind: 'support', sprite: comKinds[i % comKinds.length], label: '',
+                 x: p.x, z: p.z, scale: 0.66 + 0.5 * rnd() + 0.34 * C.community, rho: 0.5 });
+  }
+
+  /* The plaza: the social centre. Always built, because people always gather. */
+  const plazaP = place(0.3, 0.5, 0.5 + 0.2 * (rnd() - 0.5));
+  const plaza = { kind: 'plaza', sprite: 'plaza', label: '', x: plazaP.x, z: plazaP.z,
+                  scale: 0.6 + 0.4 * C.community, rho: 0.3, flat: true };
+  sites.push(plaza);
+
+  /* Build sites. Yang reaches outward: more frontier foundations and frames.
+   * Yin consolidates: shells close over, so stage-2 scaffolds dominate. Both
+   * poles put the same amount of work on screen — only its character changes. */
+  const nBuild = 2 + Math.round(4 * C.industry + 2 * Math.abs(T));
+  const builds = [];
+  for (let i = 0; i < nBuild; i++) {
+    const yangward = T > 0 ? 0.55 + 0.4 * rnd() : 0.2 + 0.5 * rnd();
+    const p = place(yangward * (T > 0 ? 1.08 : 0.9), 1, rnd());
+    const stage = T >= 0 ? (rnd() < 0.42 + 0.3 * T ? 1 : 2) : (rnd() < 0.3 ? 1 : 2);
+    builds.push({ kind: 'build', sprite: 'scaffold' + stage, label: '',
+                  x: p.x, z: p.z, scale: 0.55 + 0.35 * rnd() + 0.25 * C.industry, rho: 0.7 });
+  }
+  /* Foundation pads — a claim staked at the very edge. Yang-leaning weeks set
+   * out more of them; a yin week sets out fewer and finishes more instead. */
+  const nPads = Math.max(T > 0.1 ? 2 : 1, Math.round(1 + 3 * clamp(0.5 + T * 0.5, 0, 1) * C.extent));
+  for (let i = 0; i < nPads; i++) {
+    const p = place(0.92 + 0.3 * rnd(), 1, rnd());
+    builds.push({ kind: 'pad', sprite: 'pad', label: '', x: p.x, z: p.z,
+                  scale: 0.4 + 0.3 * rnd(), rho: 1.05, flat: true });
+  }
+  sites.push(...builds);
+
+  /* ----------------------------------------------------------------- routes
+   * Roads from the lander outward, and the paths the vehicles drive. Paving is
+   * consolidation: a yin week has more of it, a yang week has more dirt track
+   * reaching further. Neither is tidier than the other, visually. */
+  const routes = [];
+  const hubs = sites.filter(s => s.kind !== 'pad' && s.kind !== 'build')
+                    .sort((a, b) => a.z - b.z).slice(0, 8);
+  for (const h of hubs) {
+    if (h === lander) continue;
+    routes.push({ ax: lander.x, az: lander.z, bx: h.x, bz: h.z });
+  }
+  const paveFrac = clamp(0.35 + 0.45 * (0.5 - T * 0.5) + 0.2 * C.community, 0.2, 1);
+
+  /* -------------------------------------------------------------- terraform
+   * Vegetation spreads out from the rigs and the greenhouses. It is a weekly
+   * level, not a within-day animation, because the data moves weekly. */
+  const veg = [];
+  const nVeg = Math.round(10 + 54 * C.terraform);
+  for (let i = 0; i < nVeg; i++) {
+    const p = place(rnd() * (0.3 + 0.8 * C.terraform), 1, rnd());
+    veg.push({ sprite: rnd() < 0.4 + 0.3 * C.terraform ? 'moss' : 'plant',
+               x: p.x, z: p.z, scale: 0.5 + 0.8 * rnd() });
+  }
+  const ponds = [];
+  if (C.terraform > 0.38) {
+    for (let i = 0; i < 1 + Math.round(2 * C.terraform); i++) {
+      const p = place(0.25 + 0.5 * rnd(), 0.9, rnd());
+      ponds.push({ sprite: 'pond', x: p.x, z: p.z, scale: 0.5 + 0.6 * rnd() });
+    }
+  }
+
+  /* ----------------------------------------------------- undeveloped ground
+   * Past the frontier the planet is simply itself. Terrain class comes from
+   * the week's seed, so Monday is a different world. */
+  const terrain = [];
+  const kind = d.planet.terrain;
+  const BIG = { craters: 'crater', dunes: 'dune', ridges: 'ridge', flats: 'dune' }[kind];
+  /* Inside the settled band only small debris is left: the colony cleared the
+   * rest, and the buildings have to be the subject. A landform the size of a
+   * hab standing next to one just reads as a wall. */
+  for (let i = 0; i < 24; i++) {
+    const p = place(rnd() * 0.98, 1.15, rnd());
+    const r = rnd();
+    terrain.push({ sprite: r < 0.72 ? 'rock' + (i % 2)
+                          : (kind === 'craters' ? 'crater' : 'rock2'),
+                   x: p.x, z: p.z, scale: 0.35 + 0.45 * rnd() });
+  }
+  /* Right under the camera, partly cropped by the bottom edge: foreground
+   * scatter is what makes the frame feel stood in rather than looked at. */
+  for (let i = 0; i < 14; i++) {
+    const z = view.zBottom - 9 + rnd() * 12;
+    const x = (rnd() * 2 - 1) * view.halfWidthAt(z) * 0.98;
+    const r = rnd();
+    terrain.push({ sprite: r < 0.55 ? 'rock' + (i % 3) : (r < 0.8 ? 'plant' : 'moss'),
+                   x, z, scale: 0.5 + 0.7 * rnd() });
+  }
+  /* Past the frontier the planet is simply itself, all the way to the hills. */
+  for (let i = 0; i < 34; i++) {
+    const p = place(1.04 + rnd() * 2.1, 1.35, rnd());
+    const r = rnd();
+    terrain.push({ sprite: r < 0.3 ? BIG : (r < 0.52 ? 'dune2' : (r < 0.84 ? 'rock' + (i % 3) : 'crater')),
+                   x: p.x, z: p.z, scale: 0.6 + 0.85 * rnd() });
+  }
+
+  /* ------------------------------------------------------------- the people
+   * Each colonist shuttles between two places on its own clock. Nothing is
+   * tracked, nobody is late, and the count is simply how much happened. */
+  const workSites = sites.filter(s => s.kind !== 'pad' && !s.flat);
+  const crew = [];
+  const nCrew = Math.min(CFG.maxColonists, Math.round(5 + 50 * C.bustle));
+  for (let i = 0; i < nCrew; i++) {
+    const a = workSites[Math.floor(rnd() * workSites.length)] || lander;
+    let b = workSites[Math.floor(rnd() * workSites.length)] || plaza;
+    if (rnd() < 0.3) b = plaza;
+    const period = 26 + rnd() * 54;
+    crew.push({
+      ax: a.x + (rnd() - 0.5) * 9, az: a.z + (rnd() - 0.5) * 5,
+      bx: b.x + (rnd() - 0.5) * 9, bz: b.z + (rnd() - 0.5) * 5,
+      period, phase: rnd(), dwell: 0.2 + 0.3 * rnd(),
+      alt: rnd() < 0.42, home: a
+    });
+  }
+
+  /* ---------------------------------------------------------- the vehicles */
+  const vehicles = [];
+  const nVeh = Math.min(CFG.maxVehicles, 1 + Math.round(7 * C.bustle));
+  for (let i = 0; i < nVeh; i++) {
+    const hauler = i % 3 === 2;
+    const a = hubs[Math.floor(rnd() * hubs.length)] || lander;
+    const p = place(0.75 + 0.5 * rnd(), 1, rnd());
+    vehicles.push({
+      sprite: hauler ? 'hauler' : 'rover',
+      ax: a.x, az: a.z, bx: p.x, bz: p.z,
+      period: 34 + rnd() * 40, phase: rnd(), scale: hauler ? 1 : 0.92
+    });
+  }
+
+  return { view, sites, lander, plaza, builds, routes, paveFrac, veg, ponds,
+           terrain, crew, vehicles, zNear, zFar, depthSpan, place,
+           pads: builds.filter(b => b.kind === 'pad') };
+}
+
+/* ===========================================================================
+ *  BACKDROP — sky, moons, ring, stars, distant hills, ground, static terrain,
+ *  roads and vegetation, all baked once per resize into one offscreen canvas
+ *  and blitted per frame. The GL path uploads it as a texture on resize only.
+ * ======================================================================== */
+
+function bakeBackdrop(d, world, atlas, PAL, W, H) {
+  const view = world.view;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  const rnd = mulberry32(d.seed ^ 0x51A7);
+  const C = PAL;
+  const col = (c, dl, a) => hsl(c.h, c.s, clamp(c.l + (dl || 0), 2, 97), a);
+  const hy = view.horizonY;
+
+  /* ------------------------------------------------------------------- sky */
+  const sky = g.createLinearGradient(0, 0, 0, hy);
+  sky.addColorStop(0, col(C.skyHigh, -6));
+  sky.addColorStop(0.62, col(C.sky, 2));
+  sky.addColorStop(1, col(C.haze, 6));
+  g.fillStyle = sky;
+  g.fillRect(0, 0, W, hy + 2);
+
+  /* Stars: faint by day, and the night multiply pass leaves them standing.
+   * Brightness rides host uptime, exactly as the battle's starfield did. */
+  const starA = 0.1 + 0.26 * d.uptime;
+  for (let i = 0; i < 420; i++) {
+    const x = rnd() * W, y = rnd() * hy * 0.92;
+    const r = 0.4 + rnd() * 1.1;
+    g.fillStyle = `rgba(255,255,255,${(starA * (0.3 + rnd() * 0.7) * (1 - y / hy)).toFixed(3)})`;
+    g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+  }
+
+  /* Moons — 0 to 3, from the seed. A different sky every week. */
+  for (let i = 0; i < d.planet.moons; i++) {
+    const r = H * (0.028 + rnd() * 0.045);
+    const x = W * (0.12 + rnd() * 0.76), y = hy * (0.14 + rnd() * 0.46);
+    const grad = g.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.1, x, y, r);
+    grad.addColorStop(0, col(C.haze, 18, 0.95));
+    grad.addColorStop(1, col(C.haze, -16, 0.8));
+    g.fillStyle = grad;
+    g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+    g.fillStyle = col(C.haze, -26, 0.35);
+    for (let k = 0; k < 4; k++) {
+      const a = rnd() * TAU, rr = r * (0.1 + rnd() * 0.3);
+      g.beginPath();
+      g.arc(x + Math.cos(a) * r * 0.4, y + Math.sin(a) * r * 0.4, rr, 0, TAU);
+      g.fill();
+    }
+  }
+
+  /* A ring arc, on about a third of planets. */
+  if (d.planet.ring) {
+    g.save();
+    g.translate(W * 0.5, hy * 1.06);
+    g.rotate(-0.22);
+    for (let k = 0; k < 3; k++) {
+      g.strokeStyle = col(C.haze, 14 - k * 8, 0.1 + 0.1 * (2 - k));
+      g.lineWidth = H * (0.008 + k * 0.012);
+      g.beginPath();
+      g.ellipse(0, 0, W * (0.62 + k * 0.05), hy * (0.3 + k * 0.03), 0, Math.PI * 1.06, Math.PI * 1.94);
+      g.stroke();
+    }
+    g.restore();
+  }
+
+  /* Distant hills: two low ranges, sitting just under the horizon haze. */
+  for (let layer = 0; layer < 2; layer++) {
+    const base = hy + 1 + layer * 2;
+    const amp = H * (0.035 - layer * 0.012);
+    g.beginPath();
+    g.moveTo(0, base);
+    for (let x = 0; x <= W; x += W / 40) {
+      const n = Math.sin(x / W * (5 + layer * 3) + layer * 2.1) * 0.6
+              + Math.sin(x / W * (13 + layer * 5) + 1.3) * 0.4;
+      g.lineTo(x, base - amp * (0.5 + 0.5 * n));
+    }
+    g.lineTo(W, base + 4); g.lineTo(0, base + 4);
+    g.closePath();
+    g.fillStyle = col(C.rock, 22 - layer * 10, 0.55 - layer * 0.18);
+    g.fill();
+  }
+
+  /* ---------------------------------------------------------------- ground */
+  const gr = g.createLinearGradient(0, hy, 0, H);
+  gr.addColorStop(0, col(C.groundFar, 4));
+  gr.addColorStop(0.35, col(C.ground, 4));
+  gr.addColorStop(1, col(C.ground, -12));
+  g.fillStyle = gr;
+  g.fillRect(0, hy, W, H - hy);
+
+  /* Horizon haze band: the air the distance is seen through. */
+  const hz = g.createLinearGradient(0, hy - H * 0.05, 0, hy + H * 0.05);
+  hz.addColorStop(0, col(C.haze, 10, 0));
+  hz.addColorStop(0.5, col(C.haze, 10, 0.5));
+  hz.addColorStop(1, col(C.haze, 6, 0));
+  g.fillStyle = hz;
+  g.fillRect(0, hy - H * 0.05, W, H * 0.1);
+
+  /* Ground texture: broad mottling, denser toward the camera. */
+  for (let i = 0; i < 260; i++) {
+    const z = 10 + Math.pow(rnd(), 0.4) * 420;
+    const y = view.sy(z);
+    if (y > H + 20 || y < hy) continue;
+    const s = view.scaleAt(z);
+    g.fillStyle = col(C.ground, rnd() < 0.5 ? 6 : -5, 0.07 + 0.06 * rnd());
+    g.beginPath();
+    g.ellipse(rnd() * W, y, s * (2 + rnd() * 9), s * (0.5 + rnd() * 2), 0, 0, TAU);
+    g.fill();
+  }
+
+  /* --------------------------------------------- static sprites, far to near
+   * Terrain, roads, vegetation and ponds are all static for the week, so they
+   * are baked in rather than re-instanced every frame. */
+  const draw = (name, x, z, scale, alpha) => {
+    const sp = atlas.sprites[name];
+    if (!sp) return;
+    const s = view.scaleAt(z);
+    const w = sp.metres * scale * s;
+    const h = w * sp.aspect;
+    const px = view.sx(x, z), py = view.sy(z);
+    if (px + w < -40 || px - w > W + 40 || py < hy - 10 || py - h > H + 10) return;
+    g.globalAlpha = alpha === undefined ? 1 : alpha;
+    g.drawImage(atlas.canvas, sp.x, sp.y, sp.w, sp.h,
+                px - w / 2, py - h * sp.anchorY, w, h);
+    g.globalAlpha = 1;
+  };
+
+  const statics = [];
+  for (const t of world.terrain) statics.push({ ...t, kindOrder: 0 });
+  for (const r of world.routes) {
+    // Lay a road as a run of overlapping tiles, so it follows perspective.
+    const steps = 14;
+    for (let i = 0; i <= steps; i++) {
+      const f = i / steps;
+      if (rnd() > world.paveFrac && f > 0.25) continue;
+      statics.push({ sprite: 'road',
+                     x: lerp(r.ax, r.bx, f), z: lerp(r.az, r.bz, f),
+                     scale: 0.55 + 0.25 * (1 - f), alpha: 0.85, kindOrder: 1 });
+    }
+  }
+  for (const p of world.ponds) statics.push({ ...p, kindOrder: 2 });
+  for (const v of world.veg) statics.push({ ...v, kindOrder: 3 });
+  statics.sort((a, b) => (b.z - a.z) || (a.kindOrder - b.kindOrder));
+  for (const s of statics) draw(s.sprite, s.x, s.z, s.scale, s.alpha);
+
+  /* A soft vignette, same cinematic trick as Fleet Action: pull the eye to the
+   * middle of the settlement without ever going to dead black. */
+  const vg = g.createRadialGradient(W * 0.5, hy + (H - hy) * 0.42, Math.min(W, H) * 0.22,
+                                    W * 0.5, hy + (H - hy) * 0.42, Math.max(W, H) * 0.74);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(6,10,18,0.42)');
+  g.fillStyle = vg;
+  g.fillRect(0, 0, W, H);
+
+  return cv;
+}
+
+/* ===========================================================================
+ *  SCENE — the per-frame instance list. Both render paths consume this one
+ *  list, so they cannot drift apart. No allocation happens in here: every
+ *  entry comes from a preallocated pool, and every particle is a pure function
+ *  of event-local time rather than a stateful system.
+ * ======================================================================== */
+
+function makeScene(d, world, atlas) {
+  const view = world.view;
+  const SP = atlas.sprites;
+  const C = d.colony;
+  const T = d.temper;
+
+  /* --- pools ------------------------------------------------------------- */
+  const base = [], add = [], dyn = [];
+  for (let i = 0; i < CFG.maxInstances; i++) base.push({ s: null, x: 0, y: 0, w: 0, h: 0, a: 1 });
+  for (let i = 0; i < CFG.maxFx * 4 + 400; i++) add.push({ s: null, x: 0, y: 0, w: 0, h: 0, a: 1 });
+  for (let i = 0; i < 700; i++) dyn.push({ sprite: '', lit: '', x: 0, z: 0, scale: 1, a: 1, shadow: 0 });
+  let nBase = 0, nAdd = 0, nDyn = 0;
+
+  function emit(spriteName, px, py, wpx, alpha, anchorY, aspect, additive) {
+    const arr = additive ? add : base;
+    const n = additive ? nAdd : nBase;
+    if (n >= arr.length) return;
+    const it = arr[n];
+    it.s = spriteName;
+    it.w = wpx;
+    it.h = wpx * aspect;
+    it.x = px;
+    it.y = py - it.h * anchorY + it.h * 0.5;
+    it.a = alpha;
+    if (additive) nAdd = n + 1; else nBase = n + 1;
+  }
+  /* World-space emit: metres and depth in, pixels out. */
+  function world2(spriteName, x, z, scale, alpha, additive) {
+    const sp = SP[spriteName];
+    if (!sp || z < 5) return;
+    const s = view.scaleAt(z);
+    const wpx = sp.metres * scale * s;
+    if (wpx < 0.6) return;
+    const px = view.sx(x, z), py = view.sy(z);
+    if (px + wpx < -60 || px - wpx > view.W + 60) return;
+    emit(spriteName, px, py, wpx, alpha, sp.anchorY, sp.aspect, additive);
+  }
+  function pushDyn(sprite, lit, x, z, scale, a, shadow) {
+    if (nDyn >= dyn.length || z < 5) return;
+    const it = dyn[nDyn++];
+    it.sprite = sprite; it.lit = lit; it.x = x; it.z = z;
+    it.scale = scale; it.a = a; it.shadow = shadow || 0;
+  }
+
+  /* --- lighting: one colony day per loop --------------------------------- */
+  const DAWN = 0.05, DAY_END = 0.56, DUSK_END = 0.74;
+  function lighting(t) {
+    let lum, warm;
+    if (t < DAWN) { lum = lerp(0.22, 1, smooth(t / DAWN)); warm = 1 - t / DAWN; }
+    else if (t < DAY_END) { lum = 1; warm = 0.08; }
+    else if (t < DUSK_END) {
+      const f = (t - DAY_END) / (DUSK_END - DAY_END);
+      lum = lerp(1, 0.2, smooth(f)); warm = smooth(f) * 0.9;
+    } else { lum = 0.2; warm = 0; }
+    const nf = clamp((1 - lum) * 1.25, 0, 1);
+    // Multiply colour: neutral at noon, amber at the edges, deep blue at night.
+    const dayR = 1, dayG = 1, dayB = 1;
+    const nightR = 0.30, nightG = 0.37, nightB = 0.60;
+    const k = clamp((1 - lum) / 0.8, 0, 1);
+    let r = lerp(dayR, nightR, k), g2 = lerp(dayG, nightG, k), b = lerp(dayB, nightB, k);
+    r = Math.min(1.06, r + warm * 0.26); g2 += warm * 0.05; b -= warm * 0.16;
+    return { lum, nf, warm, mul: [clamp(r, 0, 1.2), clamp(g2, 0, 1.2), clamp(b, 0, 1.2)] };
+  }
+
+  /* --- event timetable --------------------------------------------------- */
+  const DUR = { build: 6.5, haul: 13, gather: 15, expedition: 17, survey: 11, incursion: 9.5 };
+  const ev = d.events.map((e, i) => {
+    const h = fnv1a('ev' + i + e.kind + e.t);
+    return { ...e, start: e.t * CFG.loopSec, dur: DUR[e.kind] || 8, h, r: (h % 1000) / 1000 };
+  });
+
+  /* Walk-cycle frame from distance covered, so feet match speed. */
+  function crewSprite(alt, dist, moving) {
+    if (!moving) return alt ? 'crewB0' : 'crew0';
+    const f = Math.floor(dist * 1.35) & 3;
+    return (alt ? 'crewB' : 'crew') + f;
+  }
+
+  /* ----------------------------------------------------------------- build */
+  function frame(now) {
+    nBase = 0; nAdd = 0; nDyn = 0;
+    const t = (now % CFG.loopSec) / CFG.loopSec;
+    const L = lighting(t);
+
+    /* -- structures. Lit windows come up as the light goes down. --------- */
+    for (const s of world.sites) {
+      pushDyn(s.sprite, SP[s.sprite + '_lit'] ? s.sprite + '_lit' : '',
+              s.x, s.z, s.scale, 1, s.flat ? 0 : 0.5);
+    }
+
+    /* -- terraforming rigs breathe vapour -------------------------------- */
+    for (const s of world.sites) {
+      if (s.sprite !== 'rig') continue;
+      const sp = SP.rig;
+      const topZ = s.z;
+      for (let k = 0; k < 3; k++) {
+        const ph = ((now * 0.22 + k * 0.33 + s.x * 0.01) % 1);
+        const sc = (0.5 + ph * 1.9) * s.scale * 2.4;
+        const lift = sp.metres * sp.aspect * s.scale * (0.76 + ph * 0.5);
+        const scale2 = view.scaleAt(topZ);
+        emit('vapor', view.sx(s.x, topZ), view.sy(topZ) - lift * scale2,
+             sc * scale2 * 3, (1 - ph) * 0.5, 0.5, 1, true);
+      }
+    }
+
+    /* -- the people ------------------------------------------------------ */
+    for (let i = 0; i < world.crew.length; i++) {
+      const c = world.crew[i];
+      const u = ((now / c.period) + c.phase) % 1;
+      // Out, dwell, back, dwell — a working day, not a commute schedule.
+      let f, moving = true;
+      const d1 = c.dwell * 0.5;
+      if (u < 0.5 - d1) f = u / (0.5 - d1);
+      else if (u < 0.5) { f = 1; moving = false; }
+      else if (u < 1 - d1) f = 1 - (u - 0.5) / (0.5 - d1);
+      else { f = 0; moving = false; }
+      const ease = smooth(clamp(f, 0, 1));
+      const x = lerp(c.ax, c.bx, ease), z = lerp(c.az, c.bz, ease);
+      const dist = (now / c.period + c.phase) * 24;
+      let sprite;
+      if (!moving) {
+        // Standing: at a work site they work, at the plaza they mill about.
+        sprite = (f > 0.5 && c.home !== world.plaza) ? 'crewWork' : (c.alt ? 'crewB0' : 'crew0');
+      } else sprite = crewSprite(c.alt, dist, true);
+      pushDyn(sprite, '', x, z, 1, 1, 1);
+      // Headlamp after dark. Nobody works in the dark unlit.
+      if (L.nf > 0.25) {
+        const sc = view.scaleAt(z);
+        emit('glow', view.sx(x, z), view.sy(z) - 1.6 * sc, 2.6 * sc, L.nf * 0.22, 0.5, 1, true);
+      }
+    }
+
+    /* -- the vehicles ---------------------------------------------------- */
+    for (const v of world.vehicles) {
+      const u = ((now / v.period) + v.phase) % 1;
+      const f = u < 0.5 ? u * 2 : 2 - u * 2;
+      const ease = smooth(f);
+      const x = lerp(v.ax, v.bx, ease), z = lerp(v.az, v.bz, ease);
+      pushDyn(v.sprite, '', x, z, v.scale, 1, 1);
+      const sc = view.scaleAt(z);
+      // Dust kicked up behind the wheels — a pure function of position.
+      for (let k = 0; k < 3; k++) {
+        const ph = ((now * 0.5 + k * 0.34) % 1);
+        const back = (u < 0.5 ? -1 : 1) * (1.6 + ph * 3.4);
+        emit('puff', view.sx(x + back, z), view.sy(z) - 0.7 * sc,
+             (1.4 + ph * 3.4) * sc, (1 - ph) * 0.3, 0.5, 1, false);
+      }
+      if (L.nf > 0.2) {
+        const dir = u < 0.5 ? 1 : -1;
+        emit('glow', view.sx(x + dir * 2.4, z), view.sy(z) - 1.4 * sc,
+             5 * sc, L.nf * 0.26, 0.5, 1, true);
+      }
+    }
+
+    /* -- lamp posts on the plaza and at the lander ----------------------- */
+    if (L.nf > 0.05) {
+      for (const s of [world.lander, world.plaza]) {
+        const sc = view.scaleAt(s.z);
+        emit('glow', view.sx(s.x, s.z), view.sy(s.z) - 3 * sc,
+             9 * sc * s.scale, L.nf * 0.34, 0.5, 1, true);
+      }
+    }
+
+    /* -- events ---------------------------------------------------------- */
+    const tSec = t * CFG.loopSec;
+    for (let i = 0; i < ev.length; i++) {
+      const e = ev[i];
+      let local = tSec - e.start;
+      if (local < 0) local += CFG.loopSec;          // wrapped from last pass
+      if (local > e.dur) continue;
+      const p = local / e.dur;                       // 0..1 through the beat
+      runEvent(e, p, local, now, L);
+    }
+
+    /* -- weather: blowing dust or drifting spores, in screen space -------
+     * Ambient only. It says what the planet is like, never how the week went. */
+    if (d.planet.weather !== 'clear') {
+      const spore = d.planet.weather === 'spores';
+      const N = spore ? 34 : 46;
+      for (let k = 0; k < N; k++) {
+        const seed = (k * 0.6180339887) % 1;
+        const speed = spore ? 0.012 + seed * 0.02 : 0.05 + seed * 0.06;
+        const u = ((now * speed + seed * 7.3) % 1);
+        const yv = (seed * 13.7) % 1;
+        const px = spore ? u * (view.W + 120) - 60 : (1 - u) * (view.W + 160) - 80;
+        const py = view.horizonY + yv * (view.H - view.horizonY)
+                 + (spore ? Math.sin(now * 0.7 + k) * 14 : 0);
+        const sz = (spore ? 3 : 4) + seed * (spore ? 4 : 9);
+        const a = (spore ? 0.4 : 0.16) * (0.35 + 0.65 * Math.sin(Math.PI * u));
+        emit(spore ? 'glow' : 'puff', px, py, sz * (spore ? 1.6 : 2.6), a, 0.5, 1, spore);
+      }
+    }
+
+    /* -- depth sort and emit --------------------------------------------- */
+    // Insertion sort: the list is near-sorted between frames and short.
+    for (let i = 1; i < nDyn; i++) {
+      const it = dyn[i];
+      let j = i - 1;
+      while (j >= 0 && dyn[j].z < it.z) { dyn[j + 1] = dyn[j]; j--; }
+      dyn[j + 1] = it;
+    }
+    for (let i = 0; i < nDyn; i++) {
+      const it = dyn[i];
+      if (it.shadow > 0) {
+        const sp = SP[it.sprite];
+        const sc = view.scaleAt(it.z);
+        if (sp) {
+          const wpx = sp.metres * it.scale * sc;
+          const hpx = wpx * sp.aspect;
+          emit('shadow', view.sx(it.x, it.z) + hpx * 0.34, view.sy(it.z) + hpx * 0.04,
+               (wpx * 0.9 + hpx * 0.7) * it.shadow, 0.34 * L.lum, 0.5,
+               SP.shadow.aspect, false);
+        }
+      }
+      world2(it.sprite, it.x, it.z, it.scale, it.a, false);
+      if (it.lit && L.nf > 0.02) world2(it.lit, it.x, it.z, it.scale, L.nf * 0.5, true);
+    }
+    return { nBase, nAdd, base, add, L, t };
+  }
+
+  /* ------------------------------------------------------------- event work
+   * Every beat is something being done, started or met. None of them damages
+   * anything, and nothing is left worse off at the end of the loop. */
+  function runEvent(e, p, local, now, L) {
+    const sc0 = (z) => view.scaleAt(z);
+    switch (e.kind) {
+
+      /* A frame goes up, a shell closes. Sparks, a work light, two welders. */
+      case 'build': {
+        const site = world.builds.length ? world.builds[e.h % world.builds.length] : world.lander;
+        const sc = sc0(site.z);
+        const sp = SP[site.sprite] || SP.hab;
+        const topY = view.sy(site.z) - sp.metres * sp.aspect * site.scale * sc * 0.75;
+        const flick = 0.55 + 0.45 * Math.sin(local * 34 + e.r * 9);
+        const fade = Math.sin(Math.PI * clamp(p, 0, 1));
+        emit('flash', view.sx(site.x, site.z), topY,
+             (3.5 + 3.5 * e.magnitude) * sc, fade * flick * 0.8, 0.5, 1, true);
+        // Sparks arc off and fall. Pure function of local time — no particles.
+        for (let k = 0; k < 9; k++) {
+          const age = (local * 2.1 + k * 0.37) % 1;
+          const a = (k * 2.399 + e.r * 6.28);
+          const dx = Math.cos(a) * age * 7 * e.magnitude;
+          const dy = Math.sin(a) * age * 5 - 9 * age + 16 * age * age;
+          emit('spark', view.sx(site.x + dx, site.z), topY + dy * sc,
+               1.9 * sc, (1 - age) * fade, 0.5, 1, true);
+        }
+        for (let k = 0; k < 2; k++) {
+          pushDyn('crewWork', '', site.x + (k ? 3.4 : -3.6), site.z + (k ? 1.2 : -0.8), 1, 1, 1);
+        }
+        break;
+      }
+
+      /* A hauler runs cargo in from the frontier. */
+      case 'haul': {
+        const far = world.pads.length ? world.pads[e.h % world.pads.length]
+                                      : { x: 0, z: world.zFar };
+        const f = smooth(p);
+        const x = lerp(far.x, world.lander.x, f), z = lerp(far.z, world.lander.z, f);
+        pushDyn('hauler', '', x, z, 1, clamp(p * 6, 0, 1) * clamp((1 - p) * 6, 0, 1), 1);
+        const sc = sc0(z);
+        for (let k = 0; k < 4; k++) {
+          const ph = ((local * 0.6 + k * 0.25) % 1);
+          emit('puff', view.sx(x + 2 + ph * 5, z), view.sy(z) - 0.8 * sc,
+               (2 + ph * 5) * sc, (1 - ph) * 0.34, 0.5, 1, false);
+        }
+        break;
+      }
+
+      /* People gather on the plaza. The only thing being produced is company. */
+      case 'gather': {
+        const n = 3 + Math.round(5 * e.magnitude);
+        const pz = world.plaza;
+        const grow = clamp(p * 4, 0, 1) * clamp((1 - p) * 4, 0, 1);
+        for (let k = 0; k < n; k++) {
+          const a = (k / n) * TAU + e.r * 6.28 + now * 0.05;
+          const r = 4 + 5 * ((k * 37 % 13) / 13);
+          const x = pz.x + Math.cos(a) * r, z = pz.z + Math.sin(a) * r * 0.42;
+          const wave = ((k + Math.floor(local * 0.7)) % 3 === 0);
+          pushDyn(wave ? 'crewWave' : (k & 1 ? 'crewB0' : 'crew0'), '', x, z, 1, grow, 1);
+        }
+        const sc = sc0(pz.z);
+        emit('glow', view.sx(pz.x, pz.z), view.sy(pz.z) - 6 * sc,
+             12 * sc, grow * (0.1 + L.nf * 0.3), 0.5, 1, true);
+        break;
+      }
+
+      /* An expedition leaves for the undeveloped ground, over the horizon.
+       * This is what reaching outward looks like; it is not a departure from
+       * anything and nothing is abandoned. */
+      case 'expedition': {
+        const f = smooth(p);
+        const outX = (e.r - 0.5) * 2 * view.halfWidthAt(world.zFar) * 1.1;
+        const x = lerp(world.lander.x, outX, f);
+        const z = lerp(world.lander.z, world.zFar + world.depthSpan * 0.9, f);
+        const fade = clamp((1 - p) * 3.4, 0, 1) * clamp(p * 8, 0, 1);
+        pushDyn('rover', '', x, z, 0.95, fade, 1);
+        if (p < 0.55) {
+          pushDyn(crewSprite(false, now * 2, true), '', x - 3.4, z + 1.1, 1, fade, 1);
+          pushDyn(crewSprite(true, now * 2 + 0.5, true), '', x + 3.6, z - 0.6, 1, fade, 1);
+        }
+        const sc = sc0(z);
+        for (let k = 0; k < 3; k++) {
+          const ph = ((local * 0.5 + k * 0.33) % 1);
+          emit('puff', view.sx(x - 3 - ph * 4, z), view.sy(z) - 0.7 * sc,
+               (2 + ph * 6) * sc, (1 - ph) * 0.3 * fade, 0.5, 1, false);
+        }
+        break;
+      }
+
+      /* A survey drone crosses, reading the ground. */
+      case 'survey': {
+        const z = lerp(world.zNear + 8, world.zFar, e.r);
+        const span = view.halfWidthAt(z) * 1.05;
+        const dir = (e.h & 1) ? 1 : -1;
+        const x = lerp(-span * dir, span * dir, smooth(p));
+        const sc = sc0(z);
+        const bob = Math.sin(local * 3.1) * 0.6;
+        const fade = clamp(p * 7, 0, 1) * clamp((1 - p) * 7, 0, 1);
+        const py = view.sy(z) - (7 + bob) * sc;
+        emit('drone', view.sx(x, z), py, SP.drone.metres * sc, fade, SP.drone.anchorY,
+             SP.drone.aspect, false);
+        emit('zap', view.sx(x, z), view.sy(z), 4.5 * sc, fade * 0.3, 0.5, 1, true);
+        emit('glow', view.sx(x, z), py, 3 * sc, fade * (0.3 + L.nf * 0.5), 0.5, 1, true);
+        break;
+      }
+
+      /* Local fauna wanders in at the perimeter and is politely shooed off.
+       * Nothing is damaged, no colonist is hurt, and the critters are fine —
+       * they turn up again next week. Downtime on the host is the only thing
+       * that puts this beat on the timetable, which is a fact about the
+       * machine and never about the week. */
+      case 'incursion': {
+        const n = 2 + Math.round(2 * e.magnitude);
+        const z0 = world.zFar - 18;
+        const bx = (e.r - 0.5) * 1.6 * view.halfWidthAt(z0);
+        const approach = clamp(p / 0.45, 0, 1);
+        const retreat = clamp((p - 0.6) / 0.4, 0, 1);
+        const push = smooth(approach) - smooth(retreat) * 1.5;
+        for (let k = 0; k < n; k++) {
+          const off = (k - (n - 1) / 2) * 4.2;
+          const x = bx + off, z = z0 - push * 12 + (k % 2) * 1.6;
+          const spr = 'critter' + (Math.floor(local * 5 + k) & 1);
+          pushDyn(spr, '', x, z, 0.9 + 0.3 * ((k * 7 % 5) / 5),
+                  clamp(p * 6, 0, 1) * clamp((1 - p) * 4, 0, 1), 1);
+        }
+        // A colonist steps up and zaps. Bright, brief, harmless.
+        const gx = bx + 5, gz = z0 - 16;
+        pushDyn('crewWork', '', gx, gz, 1, clamp(p * 5, 0, 1), 1);
+        if (p > 0.3 && p < 0.72) {
+          const sc = sc0(gz);
+          const flick = 0.4 + 0.6 * Math.abs(Math.sin(local * 26));
+          // A thin beam, not a row of lamps: many small segments beat a few
+          // fat ones, and it has to stay readable against a lit night town.
+          for (let k = 0; k < 10; k++) {
+            const f = k / 9;
+            emit('zap', view.sx(lerp(gx, bx, f), lerp(gz, z0, f)),
+                 view.sy(lerp(gz, z0, f)) - (2.6 - f * 1.4) * sc,
+                 1.5 * sc, flick * 0.3 * (1 - f * 0.35), 0.5, 1, true);
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  return { frame, lighting };
+}
+
+/* ===========================================================================
+ *  RENDER PATH A — WebGL2, one instanced draw per pass.
+ *
+ *  Pass order: backdrop quad, base sprites, a multiply quad for the time of
+ *  day, additive sprites (window light, lamps, sparks, vapour). The atlas is
+ *  uploaded premultiplied, so a single alpha multiply in the shader is correct
+ *  for both the normal and the additive pass.
+ * ======================================================================== */
+
+const VS = `#version 300 es
+in vec2 aCorner;
+in vec2 aXY;
+in vec2 aWH;
+in vec4 aUV;
+in float aA;
+uniform vec2 uRes;
+out vec2 vUV;
+out float vA;
+void main() {
+  vec2 p = aXY + (aCorner - 0.5) * aWH;
+  gl_Position = vec4(p.x / uRes.x * 2.0 - 1.0, 1.0 - p.y / uRes.y * 2.0, 0.0, 1.0);
+  vUV = aUV.xy + aCorner * aUV.zw;
+  vA = aA;
+}`;
+
+const FS = `#version 300 es
+precision mediump float;
+in vec2 vUV;
+in float vA;
+uniform sampler2D uTex;
+uniform vec4 uTint;
+out vec4 o;
+void main() {
+  o = texture(uTex, vUV) * vA * uTint;
+}`;
+
+const FLOATS = 9;   // x, y, w, h, u0, v0, du, dv, a
+
+function makeGL(canvas, atlasCanvas) {
+  const gl = canvas.getContext('webgl2', {
+    alpha: false, antialias: false, depth: false, stencil: false,
+    premultipliedAlpha: true, preserveDrawingBuffer: false,
+    powerPreference: 'low-power'
+  });
+  if (!gl) return null;
+
+  function shader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.warn('landfall: shader failed —', gl.getShaderInfoLog(s));
+      return null;
+    }
+    return s;
+  }
+  const vs = shader(gl.VERTEX_SHADER, VS), fs = shader(gl.FRAGMENT_SHADER, FS);
+  if (!vs || !fs) return null;
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    console.warn('landfall: link failed —', gl.getProgramInfoLog(prog));
+    return null;
+  }
+  gl.useProgram(prog);
+
+  const loc = {
+    corner: gl.getAttribLocation(prog, 'aCorner'),
+    xy: gl.getAttribLocation(prog, 'aXY'),
+    wh: gl.getAttribLocation(prog, 'aWH'),
+    uv: gl.getAttribLocation(prog, 'aUV'),
+    a: gl.getAttribLocation(prog, 'aA'),
+    res: gl.getUniformLocation(prog, 'uRes'),
+    tint: gl.getUniformLocation(prog, 'uTint'),
+    tex: gl.getUniformLocation(prog, 'uTex')
+  };
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(loc.corner);
+  gl.vertexAttribPointer(loc.corner, 2, gl.FLOAT, false, 0, 0);
+
+  const cap = CFG.maxInstances + 1200;
+  const data = new Float32Array(cap * FLOATS);
+  const ibuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, ibuf);
+  gl.bufferData(gl.ARRAY_BUFFER, data.byteLength, gl.DYNAMIC_DRAW);
+  const stride = FLOATS * 4;
+  const attr = (l, size, off) => {
+    gl.enableVertexAttribArray(l);
+    gl.vertexAttribPointer(l, size, gl.FLOAT, false, stride, off * 4);
+    gl.vertexAttribDivisor(l, 1);
+  };
+  attr(loc.xy, 2, 0); attr(loc.wh, 2, 2); attr(loc.uv, 4, 4); attr(loc.a, 1, 8);
+
+  function texFrom(src, premultiply) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !!premultiply);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  const atlasTex = texFrom(atlasCanvas, true);
+  let backTex = null;
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.uniform1i(loc.tex, 0);
+
+  let nUp = 0;
+  function fill(list, n, sprites, atlasSize) {
+    nUp = 0;
+    for (let i = 0; i < n && nUp < cap; i++) {
+      const it = list[i];
+      const sp = sprites[it.s];
+      if (!sp) continue;
+      const o = nUp * FLOATS;
+      data[o] = it.x; data[o + 1] = it.y;
+      data[o + 2] = it.w; data[o + 3] = it.h;
+      // Half-texel inset: stops a neighbour bleeding in under LINEAR filtering.
+      data[o + 4] = (sp.x + 0.5) / atlasSize;
+      data[o + 5] = (sp.y + 0.5) / atlasSize;
+      data[o + 6] = (sp.w - 1) / atlasSize;
+      data[o + 7] = (sp.h - 1) / atlasSize;
+      data[o + 8] = it.a;
+      nUp++;
+    }
+    if (!nUp) return 0;
+    gl.bindBuffer(gl.ARRAY_BUFFER, ibuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, data, 0, nUp * FLOATS);
+    return nUp;
+  }
+
+  return {
+    gl, lost: false,
+    setBackdrop(cv) {
+      if (backTex) gl.deleteTexture(backTex);
+      backTex = texFrom(cv, false);
+    },
+    resize(w, h) {
+      gl.viewport(0, 0, w, h);
+      gl.useProgram(prog);
+      gl.uniform2f(loc.res, w, h);
+    },
+    draw(f, sprites, W, H) {
+      gl.bindVertexArray(vao);
+      gl.useProgram(prog);
+      gl.clearColor(0.02, 0.03, 0.05, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      // 1 — backdrop
+      if (backTex) {
+        gl.blendFunc(gl.ONE, gl.ZERO);
+        gl.bindTexture(gl.TEXTURE_2D, backTex);
+        gl.uniform4f(loc.tint, 1, 1, 1, 1);
+        const o = 0;
+        data[o] = W / 2; data[o + 1] = H / 2; data[o + 2] = W; data[o + 3] = H;
+        data[o + 4] = 0; data[o + 5] = 0; data[o + 6] = 1; data[o + 7] = 1;
+        data[o + 8] = 1;
+        gl.bindBuffer(gl.ARRAY_BUFFER, ibuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, data, 0, FLOATS);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 1);
+      }
+
+      // 2 — base sprites
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+      gl.uniform4f(loc.tint, 1, 1, 1, 1);
+      let n = fill(f.base, f.nBase, sprites, ATLAS_SIZE);
+      if (n) gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+
+      // 3 — time of day, as a multiply over everything drawn so far
+      const m = f.L.mul;
+      if (m[0] < 0.995 || m[1] < 0.995 || m[2] < 0.995) {
+        gl.blendFunc(gl.ZERO, gl.SRC_COLOR);
+        gl.uniform4f(loc.tint, m[0], m[1], m[2], 1);
+        const sp = sprites.px;
+        const o = 0;
+        data[o] = W / 2; data[o + 1] = H / 2; data[o + 2] = W; data[o + 3] = H;
+        data[o + 4] = (sp.x + 2) / ATLAS_SIZE; data[o + 5] = (sp.y + 2) / ATLAS_SIZE;
+        data[o + 6] = (sp.w - 4) / ATLAS_SIZE; data[o + 7] = (sp.h - 4) / ATLAS_SIZE;
+        data[o + 8] = 1;
+        gl.bindBuffer(gl.ARRAY_BUFFER, ibuf);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, data, 0, FLOATS);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, 1);
+      }
+
+      // 4 — lights
+      gl.blendFunc(gl.ONE, gl.ONE);
+      gl.uniform4f(loc.tint, 1, 1, 1, 1);
+      n = fill(f.add, f.nAdd, sprites, ATLAS_SIZE);
+      if (n) gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+    }
+  };
+}
+
+/* ===========================================================================
+ *  RENDER PATH B — Canvas 2D. Same instance list, same pass order. Taken when
+ *  WebGL2 is unavailable, the shaders fail, or the context is lost at runtime.
+ * ======================================================================== */
+
+function makeC2D(canvas, atlasCanvas) {
+  const g = canvas.getContext('2d');
+  let backdrop = null;
+  return {
+    setBackdrop(cv) { backdrop = cv; },
+    resize() { },
+    draw(f, sprites, W, H) {
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.globalCompositeOperation = 'source-over';
+      g.globalAlpha = 1;
+      if (backdrop) g.drawImage(backdrop, 0, 0, W, H);
+      else { g.fillStyle = '#05070c'; g.fillRect(0, 0, W, H); }
+
+      for (let i = 0; i < f.nBase; i++) {
+        const it = f.base[i], sp = sprites[it.s];
+        if (!sp || it.a <= 0.004) continue;
+        g.globalAlpha = it.a > 1 ? 1 : it.a;
+        g.drawImage(atlasCanvas, sp.x, sp.y, sp.w, sp.h,
+                    it.x - it.w / 2, it.y - it.h / 2, it.w, it.h);
+      }
+
+      const m = f.L.mul;
+      if (m[0] < 0.995 || m[1] < 0.995 || m[2] < 0.995) {
+        g.globalAlpha = 1;
+        g.globalCompositeOperation = 'multiply';
+        g.fillStyle = `rgb(${Math.round(m[0] * 255)} ${Math.round(m[1] * 255)} ${Math.round(m[2] * 255)})`;
+        g.fillRect(0, 0, W, H);
+      }
+
+      g.globalCompositeOperation = 'lighter';
+      for (let i = 0; i < f.nAdd; i++) {
+        const it = f.add[i], sp = sprites[it.s];
+        if (!sp || it.a <= 0.004) continue;
+        g.globalAlpha = it.a > 1 ? 1 : it.a;
+        g.drawImage(atlasCanvas, sp.x, sp.y, sp.w, sp.h,
+                    it.x - it.w / 2, it.y - it.h / 2, it.w, it.h);
+      }
+      g.globalCompositeOperation = 'source-over';
+      g.globalAlpha = 1;
+    }
+  };
+}
+
+/* ===========================================================================
+ *  BOOT
+ * ======================================================================== */
+
+(function main() {
+  const canvas = document.getElementById('c');
+  const q = new URLSearchParams(location.search);
+  const qNum = (k, lo, hi) => {
+    const v = parseFloat(q.get(k));
+    return isFinite(v) ? clamp(v, lo, hi) : null;
+  };
+
+  const data = readData();
+  // Debug overrides, for screenshotting a specific moment or previewing how
+  // another week's planet and temper would read. Never used by the wallpaper.
+  const oTemper = qNum('temper', -1, 1);
+  if (oTemper !== null) data.temper = oTemper;
+  for (const k of ['extent', 'bustle', 'industry', 'community', 'terraform']) {
+    const v = qNum(k, 0, 1);
+    if (v !== null) data.colony[k] = v;
+  }
+  if (q.get('seed')) {
+    const s = fnv1a('landfall|' + q.get('seed'));
+    const r = mulberry32(s);
+    data.seed = s;
+    data.planet = {
+      skyHue: Math.floor(r() * 360), groundHue: Math.floor(r() * 360),
+      rockHue: Math.floor(r() * 360), vegHue: 90 + Math.floor(r() * 110),
+      terrain: ['dunes', 'ridges', 'craters', 'flats'][Math.floor(r() * 4)],
+      moons: Math.floor(r() * 3), ring: r() < 0.35,
+      weather: ['clear', 'dust', 'spores'][Math.floor(r() * 3)]
+    };
+  }
+  const fpsCap = qNum('fps', 1, 60) || CFG.fps;
+  const t0 = qNum('t', 0, 1e6) || 0;
+
+  const PAL = buildPalette(data);
+  const atlas = makeAtlas(PAL, mulberry32(data.seed));
+
+  let renderer = q.get('gl') === '0' ? null : makeGL(canvas, atlas.canvas);
+  let usingGL = !!renderer;
+  if (!renderer) renderer = makeC2D(canvas, atlas.canvas);
+
+  canvas.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();
+    if (!usingGL) return;
+    console.warn('landfall: WebGL context lost — falling back to Canvas 2D');
+    usingGL = false;
+    renderer = makeC2D(canvas, atlas.canvas);
+    layout(true);
+  }, false);
+
+  let W = 0, H = 0, view = null, world = null, scene = null, backdrop = null;
+
+  function layout(force) {
+    const dpr = Math.min(window.devicePixelRatio || 1, CFG.dprMax);
+    const w = Math.max(320, Math.round(window.innerWidth * dpr));
+    const h = Math.max(240, Math.round(window.innerHeight * dpr));
+    if (!force && w === W && h === H) return;
+    W = w; H = h;
+    canvas.width = W; canvas.height = H;
+    view = makeView(W, H);
+    world = buildWorld(data, view, atlas);
+    scene = makeScene(data, world, atlas);
+    backdrop = bakeBackdrop(data, world, atlas, PAL, W, H);
+    renderer.resize(W, H);
+    renderer.setBackdrop(backdrop);
+  }
+  layout(true);
+
+  let resizeTimer = 0;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => layout(false), 150);
+  });
+
+  /* Time-gated rAF: 20 fps by default, and the browser parks rAF entirely when
+   * the desktop is occluded or minimized, so an idle wallpaper costs nothing. */
+  const interval = 1000 / fpsCap;
+  let last = -1e9;
+  const started = performance.now();
+
+  function tick(ts) {
+    requestAnimationFrame(tick);
+    if (ts - last < interval - 1) return;
+    last = ts;
+    const now = t0 + (ts - started) / 1000;
+    const f = scene.frame(now);
+    renderer.draw(f, atlas.sprites, W, H);
+  }
+  requestAnimationFrame(tick);
+
+  // A tiny handle for the capture harness and for debugging; nothing reads it
+  // in normal operation.
+  window.LANDFALL = {
+    get info() {
+      return { gl: usingGL, planet: data.planet, colony: data.colony,
+               temper: data.temper, seed: data.seed,
+               sites: world.sites.length, crew: world.crew.length,
+               events: data.events.length, size: [W, H] };
+    }
+  };
+})();
+</script>
+</body>
+</html>
